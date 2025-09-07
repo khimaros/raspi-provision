@@ -1,0 +1,10 @@
+#!/bin/bash
+
+set -euo pipefail
+
+username="$1"
+password="$2"
+
+passhash=$(echo "$password" | openssl passwd -6 -stdin)
+
+echo "$username:$passhash"

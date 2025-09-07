@@ -1,0 +1,25 @@
+#!/bin/bash
+
+set -euo pipefail
+
+path="$1"
+append="$2"
+
+current="$(cat "$path")"
+
+if [[ ${#current} < 1 ]]; then
+       echo "$path is empty"
+       exit 1
+fi
+
+echo "current cmdline: ${current}"
+
+grep -q "$append" "$path" && echo "${path} already contains ${append}, skipping" && exit 0
+
+new="${current} ${append}"
+
+echo "setting new cmdline: ${new}"
+
+echo "$new" > "$path"
+
+echo -en "new file contents: "; cat "$path"

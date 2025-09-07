@@ -1,0 +1,4 @@
+/images/
+/rootfs/root/.ssh/authorized_keys
+/rootfs/home/empusa/.ssh/authorized_keys
+/bootfs/userconf.txt

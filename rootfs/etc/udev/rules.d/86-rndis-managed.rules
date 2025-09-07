@@ -1,0 +1,3 @@
+# allow NetworkManager to manage RNDIS devices
+# overrides the values in /lib/udev/rules.d/85-nm-unmanaged.rules
+ENV{DEVTYPE}=="gadget", ENV{NM_UNMANAGED}="0"
