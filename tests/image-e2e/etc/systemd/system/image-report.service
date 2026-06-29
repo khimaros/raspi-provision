@@ -1,0 +1,14 @@
+[Unit]
+Description=virtual test harness image report
+# overlay images: order after the first-boot grow so the report sees the grown
+# persist (on a plain image overlay-firstboot does not exist, so this is a no-op).
+# after NetworkManager so the NM connections are loaded when the report queries them.
+After=overlay-firstboot.service NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/image-report
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

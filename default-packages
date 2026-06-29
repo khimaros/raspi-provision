@@ -1,4 +1,7 @@
+locales-all
 vim
 make
 rsync
 git
+screen
+gpiod

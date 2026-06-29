@@ -1,4 +1,6 @@
+/customize.env
 /images/
+/tests/.work/
 /rootfs/root/.ssh/authorized_keys
-/rootfs/home/empusa/.ssh/authorized_keys
+/rootfs/home/*/.ssh/authorized_keys
 /bootfs/userconf.txt

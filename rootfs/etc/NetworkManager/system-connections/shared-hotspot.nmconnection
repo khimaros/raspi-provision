@@ -2,14 +2,15 @@
 id=shared-hotspot
 type=wifi
 autoconnect=true
+interface-name=wlan1
 
 [wifi]
 mode=ap
-ssid=empusa
+ssid=raspberrypi
 
 [wifi-security]
 key-mgmt=wpa-psk
-psk=empusa05
+psk=raspberrypi
 
 [ipv4]
 address1=10.55.2.1/24

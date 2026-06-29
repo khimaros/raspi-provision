@@ -1,0 +1,36 @@
+#!/bin/bash
+# seed the persist partition with the state that must survive reboots under the
+# ephemeral overlay root, and bake a pristine factory snapshot for resets. run
+# on-device while the root is still writable, BEFORE enabling overlay root.
+# idempotent: existing state is left as-is so it is not clobbered on re-run.
+#
+# layout (kept in sync with rootfs/etc/initramfs-tools/scripts/overlay):
+#   /persist/state/<path>   bind sources for the ephemeral shape
+#   /persist/factory/state.tar  pristine snapshot restored by a factory reset
+
+set -euo pipefail
+
+PERSIST_LABEL=persist
+PERSIST_MNT=/persist
+STATE="$PERSIST_MNT/state"
+FACTORY_DIR="$PERSIST_MNT/factory"
+FACTORY_TAR="$FACTORY_DIR/state.tar"
+# files/dirs whose runtime changes must persist. machine-id is included so the
+# device keeps a stable identity across reboots.
+PERSIST_PATHS=(etc/ssh etc/NetworkManager/system-connections var/lib/NetworkManager home etc/machine-id)
+
+mountpoint -q "$PERSIST_MNT" || { mkdir -p "$PERSIST_MNT"; mount "LABEL=$PERSIST_LABEL" "$PERSIST_MNT"; }
+mkdir -p "$STATE" "$FACTORY_DIR"
+
+for p in "${PERSIST_PATHS[@]}"; do
+	src="/$p"; dst="$STATE/$p"
+	[ -e "$src" ] || continue
+	[ -e "$dst" ] && continue
+	mkdir -p "$(dirname "$dst")"
+	cp -a "$src" "$dst"
+done
+
+# capture the pristine snapshot once, at first seed.
+[ -f "$FACTORY_TAR" ] || tar -C "$STATE" -cf "$FACTORY_TAR" .
+sync
+echo "persist seeded at $PERSIST_MNT (factory snapshot: $FACTORY_TAR)"

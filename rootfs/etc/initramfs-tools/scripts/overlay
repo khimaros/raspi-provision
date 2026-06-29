@@ -1,0 +1,182 @@
+#!/bin/sh
+# read-only root via overlayfs. selected by 'boot=overlay' on the kernel
+# cmdline, which makes initramfs-tools source this script instead of
+# /scripts/local. the real root is mounted read-only as the lower layer so an
+# unclean power loss cannot corrupt it; a writable upper layer is stacked over
+# it. enable/disable with toolbox/overlay-enable.
+#
+# upper-layer shape, chosen by the 'overlay-upper=' cmdline token:
+#   tmpfs   (default) -- volatile RAM upper; every boot is a clean slate. identity
+#                        (ssh keys, machine-id, NM connections, /home) is bind-
+#                        mounted from the persist partition (see PERSIST_BINDS), and
+#                        other changes can be made durable on demand with
+#                        toolbox/overlay-commit -- committed changes live on persist
+#                        as the upper of an inner overlay over the base (so
+#                        deletions persist too), with the tmpfs upper stacked above.
+#   persist           -- the persist partition itself; all changes survive.
+#
+# this script also performs the factory reset (see factory_reset) before the
+# upper is assembled, so the reset happens while nothing is live yet.
+
+# reuse initramfs-tools' local script; we override only the root-mount step.
+. /scripts/local
+
+# filesystem labels written by toolbox/partition-persist and the raspios image.
+PERSIST_LABEL=persist
+BOOT_LABEL=bootfs
+# flag file on the FAT boot partition that requests a factory reset.
+RESET_FLAG=factory-reset
+# layout on the persist partition. keep in sync with toolbox/seed-persist.
+PERSIST_STATE=state
+PERSIST_FACTORY=factory/state.tar
+PERSIST_DATA=data
+PERSIST_WORK=work
+# paths bind-mounted from the persist partition in the ephemeral shape. keep in
+# sync with toolbox/seed-persist (PERSIST_PATHS).
+PERSIST_BINDS="etc/ssh etc/NetworkManager/system-connections var/lib/NetworkManager home"
+
+find_dev() { blkid -L "$1" 2>/dev/null || findfs "LABEL=$1" 2>/dev/null || true; }
+
+cmdline_value() { # cmdline_value <key>  -> value of key=... from /proc/cmdline
+	for arg in $(cat /proc/cmdline); do
+		case "$arg" in "$1"=*) echo "${arg#"$1"=}"; return ;; esac
+	done
+}
+
+# restore the persist partition to its provisioned state. runs from the
+# initramfs (nothing mounted from the overlay yet), so it can safely rewrite the
+# writable layer of either shape. triggered by the RESET_FLAG on the boot fs.
+factory_reset() {
+	boot_dev="$(find_dev "$BOOT_LABEL")"
+	[ -n "$boot_dev" ] || return 0
+	mkdir -p /reset-boot
+	mount -t vfat "$boot_dev" /reset-boot 2>/dev/null || { rmdir /reset-boot; return 0; }
+	if [ ! -e "/reset-boot/$RESET_FLAG" ]; then
+		umount /reset-boot; rmdir /reset-boot; return 0
+	fi
+
+	log_begin_msg "Factory reset requested; restoring persisted state"
+	persist_dev="$(find_dev "$PERSIST_LABEL")"
+	if [ -n "$persist_dev" ]; then
+		mkdir -p /reset-persist
+		mount -t ext4 "$persist_dev" /reset-persist
+		# persistent shape: discard the writable upper (reverts to the
+		# read-only lower image). ephemeral shape: reseed state from factory.
+		rm -rf "/reset-persist/$PERSIST_DATA" "/reset-persist/$PERSIST_WORK"
+		if [ -f "/reset-persist/$PERSIST_FACTORY" ]; then
+			rm -rf "/reset-persist/$PERSIST_STATE"
+			mkdir -p "/reset-persist/$PERSIST_STATE"
+			tar -C "/reset-persist/$PERSIST_STATE" -xf "/reset-persist/$PERSIST_FACTORY"
+		fi
+		umount /reset-persist; rmdir /reset-persist
+	fi
+	rm -f "/reset-boot/$RESET_FLAG"
+	log_end_msg
+	umount /reset-boot; rmdir /reset-boot
+}
+
+local_mount_root()
+{
+	local_top
+	local_device_setup "${ROOT}" "root file system"
+	ROOT="${DEV}"
+
+	if [ -z "${ROOTFSTYPE}" ] || [ "${ROOTFSTYPE}" = auto ]; then
+		FSTYPE=$(get_fstype "${ROOT}")
+	else
+		FSTYPE=${ROOTFSTYPE}
+	fi
+
+	local_premount
+
+	# lower: the real root, always read-only -- power loss cannot corrupt it.
+	mkdir -p /lower
+	# shellcheck disable=SC2086
+	mount -r -t "${FSTYPE}" ${ROOTFLAGS} "${ROOT}" /lower
+
+	# the overlay module is not in the stock initramfs (we patch in this script
+	# offline, not a rebuilt initramfs), so load it from the real root's module
+	# tree now that it is mounted. modprobe -d handles the compressed .ko.xz.
+	modprobe overlay 2>/dev/null || modprobe -d /lower overlay 2>/dev/null || true
+
+	factory_reset
+
+	persist_dev="$(find_dev "$PERSIST_LABEL")"
+	upper_mode="$(cmdline_value overlay-upper)"
+	[ -n "$upper_mode" ] || upper_mode=tmpfs
+
+	# ---- persistent shape: the persist partition IS the writable upper ----
+	if [ "$upper_mode" = persist ] && [ -n "$persist_dev" ]; then
+		mkdir -p /upper
+		mount -t ext4 "$persist_dev" /upper
+		mkdir -p "/upper/$PERSIST_DATA" "/upper/$PERSIST_WORK"
+		mount -t overlay \
+			-o "lowerdir=/lower,upperdir=/upper/$PERSIST_DATA,workdir=/upper/$PERSIST_WORK" \
+			overlay "${rootmnt}"
+		# expose persist so grow-persist can resize it online (the raw device is
+		# busy under the live upper, so an offline resize cannot open it).
+		mkdir -p "${rootmnt}/persist"
+		mount --bind /upper "${rootmnt}/persist"
+		return 0
+	fi
+
+	# ---- ephemeral (tmpfs) shape ----
+	# changes live in a volatile RAM upper and vanish on reboot, UNLESS committed
+	# with overlay-commit. committed changes live on persist as the UPPER of an
+	# inner overlay over the base (so whiteouts apply and deletions persist); a
+	# volatile tmpfs upper then stacks on top as the outer overlay:
+	#   inner: base(/lower) + persist committed upper (PERSIST_DATA) -> /committed
+	#   outer: /committed + tmpfs upper -> rootmnt
+	# the disk is read-only in normal operation (all writes hit the tmpfs upper);
+	# only a commit (the initramfs fold below) writes persist. power-safe.
+	upper_mode=tmpfs
+	outer_lower=/lower
+	if [ -n "$persist_dev" ]; then
+		mkdir -p /persist-disk
+		mount -t ext4 "$persist_dev" /persist-disk
+		# fold a staged commit into the committed upper before assembling. staging
+		# and PERSIST_DATA are both overlay-upper format (regular files plus
+		# whiteouts as char 0:0 for deletions), so the tar pipe merges them faithfully.
+		if [ -f "/persist-disk/.commit-pending" ]; then
+			log_begin_msg "overlay-commit: folding staged changes into persist"
+			mkdir -p "/persist-disk/$PERSIST_DATA" "/persist-disk/staging/$PERSIST_DATA"
+			tar -C "/persist-disk/staging/$PERSIST_DATA" -cf - . 2>/dev/null \
+				| tar -C "/persist-disk/$PERSIST_DATA" -xf - 2>/dev/null || true
+			rm -rf "/persist-disk/staging" "/persist-disk/.commit-pending"
+			log_end_msg
+		fi
+		mkdir -p "/persist-disk/$PERSIST_DATA" "/persist-disk/$PERSIST_WORK" /committed
+		# inner overlay: committed changes (incl. deletions) over the base.
+		mount -t overlay \
+			-o "lowerdir=/lower,upperdir=/persist-disk/$PERSIST_DATA,workdir=/persist-disk/$PERSIST_WORK" \
+			overlay-committed /committed
+		outer_lower=/committed
+	fi
+
+	mkdir -p /upper
+	mount -t tmpfs -o mode=0755 tmpfs /upper
+	mkdir -p "/upper/$PERSIST_DATA" "/upper/$PERSIST_WORK"
+	mount -t overlay \
+		-o "lowerdir=$outer_lower,upperdir=/upper/$PERSIST_DATA,workdir=/upper/$PERSIST_WORK" \
+		overlay "${rootmnt}"
+
+	[ -n "$persist_dev" ] || return 0
+
+	# expose persist (committed layer, staging, grow target) and the live tmpfs
+	# upper in the booted root so overlay-commit can stage and grow-persist resize.
+	mkdir -p "${rootmnt}/persist"
+	mount --bind /persist-disk "${rootmnt}/persist"
+	mkdir -p "${rootmnt}/persist/live-upper"
+	mount --bind /upper "${rootmnt}/persist/live-upper"
+
+	# re-attach persisted identity over the volatile upper so ssh host keys,
+	# machine-id, NM connections and /home survive reboots without a commit.
+	for p in $PERSIST_BINDS; do
+		src="${rootmnt}/persist/$PERSIST_STATE/$p"
+		[ -d "$src" ] || continue
+		mkdir -p "${rootmnt}/$p"
+		mount --bind "$src" "${rootmnt}/$p"
+	done
+	mid="${rootmnt}/persist/$PERSIST_STATE/etc/machine-id"
+	[ -f "$mid" ] && mount --bind "$mid" "${rootmnt}/etc/machine-id"
+}

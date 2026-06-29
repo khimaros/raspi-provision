@@ -1,0 +1,50 @@
+#!/bin/bash
+# grow the persist partition to fill the rest of its disk. the built image ships
+# persist at a fixed (small) size so the artifact stays sparse; on the first boot
+# of a flashed card this reclaims the remaining space. persist is the last
+# partition and (under the overlay root) the only writable store -- the root is
+# read-only and never needs to grow. growing the last partition moves no data, so
+# it is safe live; the filesystem is grown online (resize2fs handles a mounted
+# fs), since under the overlay root persist is mounted as the upper. idempotent:
+# skips when persist already fills the disk, so it can run on every boot.
+#
+# run as root. usage: grow-persist [persist-device]  (default: by 'persist' label)
+
+set -euo pipefail
+
+PERSIST_LABEL=persist
+SLACK_MIB=16  # treat persist ending within this of the disk end as already full
+
+persist_dev="${1:-$(blkid -L "$PERSIST_LABEL" 2>/dev/null || true)}"
+[ -n "$persist_dev" ] || { echo "grow-persist: no persist partition; skipping"; exit 0; }
+mounted=0
+findmnt -rno TARGET "$persist_dev" >/dev/null 2>&1 && mounted=1
+
+name="$(basename "$persist_dev")"
+disk="/dev/$(lsblk -no pkname "$persist_dev")"
+partnum="$(cat "/sys/class/block/$name/partition")"
+
+geom="$(parted -sm "$disk" unit MiB print 2>/dev/null)"
+disk_end="$(printf '%s\n' "$geom" | awk -F: 'NR==2 { sub(/MiB/,"",$2); print $2 }')"
+part_end="$(printf '%s\n' "$geom" | awk -F: -v n="$partnum" '$1==n { sub(/MiB/,"",$3); print $3 }')"
+[ -n "$disk_end" ] && [ -n "$part_end" ] || { echo "grow-persist: could not read geometry; skipping"; exit 0; }
+
+if [ "$(awk -v d="$disk_end" -v p="$part_end" -v s="$SLACK_MIB" 'BEGIN{ print (d-p > s) ? 1 : 0 }')" != 1 ]; then
+	echo "grow-persist: persist already fills $disk; nothing to do"
+	exit 0
+fi
+
+echo "grow-persist: extending $persist_dev (partition $partnum) to fill $disk"
+# the partition is the live overlay upper, so it is mounted and the disk is busy.
+# parted (and BLKRRPART) cannot re-read a busy disk's table and refuse to resize a
+# mounted partition; instead rewrite just this last partition with sfdisk (', +'
+# keeps the start and extends to fill, --no-reread skips the failing whole-table
+# re-read) and push the new size to the kernel with partx -u, whose BLKPG resize
+# works on an in-use partition. growing the last partition moves no data.
+echo ', +' | sfdisk --no-reread --force -N "$partnum" "$disk"
+partx -u --nr "$partnum" "$disk" 2>/dev/null || partprobe "$disk" 2>/dev/null || true
+# online grow when mounted (the overlay upper); offline-check + grow otherwise.
+[ "$mounted" -eq 1 ] || e2fsck -fy "$persist_dev" || true
+resize2fs "$persist_dev"
+sync
+echo "grow-persist: persist now fills $disk"

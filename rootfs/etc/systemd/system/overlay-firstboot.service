@@ -1,0 +1,18 @@
+[Unit]
+Description=grow persist and seed identity on the overlay root
+# order only after the ssh host keys are regenerated so the tmpfs-shape seed
+# captures real values (machine-id is committed earlier, in sysinit). do NOT
+# depend on the network or userconfig: those sit behind network-online.target,
+# which would queue this whole job behind the ~120s networkd-wait-online timeout
+# even though grow/seed need no network. only runs on an overlay boot; build-image
+# enables it (the wants symlink) only for OVERLAY images.
+After=regenerate_ssh_host_keys.service
+ConditionKernelCommandLine=boot=overlay
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/overlay-firstboot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

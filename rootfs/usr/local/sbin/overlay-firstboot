@@ -1,0 +1,25 @@
+#!/bin/bash
+# first-boot finishing for the offline-baked overlay root. the image already
+# boots overlay directly (build-image patched the initramfs and set boot=overlay
+# offline), so this only does the two things that need the running card: grow the
+# persist partition to fill it, and -- for the tmpfs shape -- seed the persisted
+# identity (ssh host keys, machine-id, NetworkManager, /home) so it survives the
+# volatile upper. no initramfs build and no reboot. both steps are idempotent, so
+# this can run on every overlay boot (it only does work the first time).
+set -euo pipefail
+exec >/dev/console 2>&1
+
+# upper-layer shape, taken from the kernel cmdline the image was built with.
+upper=tmpfs
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in overlay-upper=*) upper="${arg#overlay-upper=}" ;; esac
+done
+
+/usr/local/sbin/grow-persist
+
+# the persist shape keeps everything in the upper, so it needs no seed; the tmpfs
+# shape captures identity into /persist/state (mounted by the overlay premount).
+if [ "$upper" = tmpfs ]; then
+	/usr/local/sbin/seed-persist
+fi
+echo "overlay-firstboot: done (upper=$upper)"

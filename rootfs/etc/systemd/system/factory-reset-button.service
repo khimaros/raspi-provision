@@ -1,0 +1,13 @@
+[Unit]
+Description=factory reset button check
+DefaultDependencies=no
+After=systemd-udevd.service
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/factory-reset-button
+
+[Install]
+WantedBy=sysinit.target

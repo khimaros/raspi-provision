@@ -1,0 +1,53 @@
+#!/bin/bash
+# make the current volatile (tmpfs) overlay changes durable. only meaningful on a
+# tmpfs overlay image: the root runs from a RAM upper that is discarded on reboot,
+# so this stages the live upper onto the persist partition and reboots; the
+# initramfs folds the staged delta into the committed layer (an extra read-only
+# overlay lower) before reassembling the root. committed changes then survive
+# reboots. identity (ssh keys etc.) already persists via the state binds.
+#
+# the committed layer lives on persist (the big card-filling partition), so size is
+# not a constraint. additions, modifications and deletions all persist; volatile
+# paths (the swapfile, /var/log, /var/cache, /var/tmp, /tmp) are excluded so a
+# commit captures meaningful state rather than swap/log/cache churn.
+#
+# run as root. usage: overlay-commit [--no-reboot]
+
+set -euo pipefail
+
+PERSIST=/persist
+LIVE_UPPER="$PERSIST/live-upper/data"
+STAGING="$PERSIST/staging/data"
+FLAG="$PERSIST/.commit-pending"
+
+[ "$(id -u)" -eq 0 ] || { echo "overlay-commit: must run as root (use sudo)"; exit 1; }
+
+# only valid on a tmpfs overlay boot, where the live upper is exposed.
+upper=tmpfs
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in overlay-upper=*) upper="${arg#overlay-upper=}" ;; esac
+done
+[ "$upper" = tmpfs ] || { echo "overlay-commit: only for tmpfs overlay images (this boot is upper=$upper); nothing to do"; exit 1; }
+[ -d "$LIVE_UPPER" ] || { echo "overlay-commit: live upper not found at $LIVE_UPPER (not a committable overlay boot?)"; exit 1; }
+
+echo "overlay-commit: staging current changes onto persist..."
+rm -rf "$PERSIST/staging"
+mkdir -p "$STAGING"
+# copy the live delta preserving overlayfs whiteouts (char 0:0 device nodes, kept
+# by -D within -a) and opaque-dir xattrs (-X), so deletions persist too. exclude
+# volatile paths so a commit captures meaningful state, not log/cache/temp churn.
+rsync -aHAX \
+	--exclude='/var/swap' \
+	--exclude='/var/log' --exclude='/var/cache' --exclude='/var/tmp' --exclude='/tmp' \
+	"$LIVE_UPPER/" "$STAGING/"
+sync
+touch "$FLAG"
+sync
+
+echo "overlay-commit: staged $(du -sh "$STAGING" 2>/dev/null | cut -f1) of changes."
+if [ "${1:-}" = "--no-reboot" ]; then
+	echo "overlay-commit: --no-reboot set; the commit applies on the next boot."
+else
+	echo "overlay-commit: rebooting to fold the commit into the committed layer..."
+	systemctl reboot
+fi

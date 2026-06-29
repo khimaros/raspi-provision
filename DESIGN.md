@@ -1,0 +1,226 @@
+# DESIGN
+
+## provisioning
+
+`raspi-provision` overlays configuration onto an unmodified Raspberry Pi OS
+image rather than building a custom image. the working tree mirrors the target
+filesystem layout (`rootfs/` for the ext4 root, `bootfs/` for the FAT firmware
+partition); `make image` runs `toolbox/build-image`, which lays that tree onto a
+copy of the upstream image offline and unprivileged
+(libguestfs/guestfish, no loop-mount and no sudo) and bakes the per-device bits
+(hostname/user/password/hotspot) from the `CUSTOM_*` vars at build time, leaving
+the working tree untouched.
+
+connectivity is provided by three NetworkManager `shared` connections, each on
+its own subnet so they can coexist:
+
+- `shared-rndis`   (usb0)  10.55.0.1/24 -- USB gadget, default first-boot path
+- `shared-ethernet` (eth)  10.55.1.1/24
+- `shared-hotspot` (wlan1) 10.55.2.1/24 -- AP interface added from wlan0
+
+the USB gadget is brought up by loading `dwc2,g_ether` from the kernel cmdline.
+the hotspot uses a second virtual interface created from wlan0 by
+`iw-dev-wlan1.service`.
+
+## resilience to power loss
+
+the sdcard root corrupts when writes are in flight as the power rail drops, and
+flash wears with write volume. the defense is two complementary layers.
+
+### phase 1: reduce writes (implemented)
+
+applied unconditionally, independent of the read-only root:
+
+- journald `Storage=volatile` -- the journal lives in `/run` (RAM), not the sdcard
+- `noatime` on the root mount (already the stock raspios fstab default; not set
+  via `rootflags=`, which the no-initramfs boot path rejects)
+- swap and zram disabled entirely. trixie's default `zram+file` swap keeps a
+  `/var/swap` writeback file -- a flash writer, and ~150-230MB of RAM under the
+  tmpfs overlay root -- and a light appliance with ample RAM does not need swap;
+  without it, memory pressure fails fast (oom) instead of thrashing. trixie layers
+  swap in three places, so disabling it takes three overrides in `rootfs/`:
+  `etc/rpi/swap.conf.d/99-no-swap.conf` (`Mechanism=none` -- turns off rpi-swap and
+  removes `/var/swap`), `etc/systemd/zram-generator.conf` (no `[zram0]` -- no zram
+  swap setup), and `etc/modules-load.d/20-zram-generator.conf` (empty -- stops the
+  force-load of the zram module that otherwise creates an unused `/dev/zram0`). (the
+  older `dphys-swapfile.service -> /dev/null` mask targeted a mechanism trixie no
+  longer uses, so it never actually disabled swap; kept as a harmless backstop.)
+- `apt-daily*` and `man-db` periodic timers masked, so the box only writes when
+  `make update` pushes changes. `fstrim` is left enabled (TRIM aids flash health)
+
+mask symlinks ship in `rootfs/etc/systemd/system/` and are laid down by `make image`.
+
+### phase 2: read-only root + persistent partition (implemented)
+
+root mounts read-only under an overlayfs. this follows the same mechanism
+`raspi-config` (`enable_overlayfs`) uses, reproduced offline where possible:
+
+- an initramfs premount script at `/etc/initramfs-tools/scripts/overlay`
+  mounts the real root read-only at `/lower`, mounts an upper, and stacks them
+  as `overlay` on the real root mount. `overlay` is added to
+  `/etc/initramfs-tools/modules`. these two files are static and ship in
+  `rootfs/`.
+- on the FAT firmware partition, `config.txt` gets `initramfs initrd.img-<KERN>-overlay`
+  and `cmdline.txt` is prefixed with `boot=overlay`.
+- the initramfs is kernel-version-bound. the on-device `make overlay` flow
+  builds a fresh one over SSH (`update-initramfs -c -k <KERN>`, renamed to the
+  `-overlay` name). the offline `make image` flow instead patches the stock
+  initramfs in place: it adds only `/scripts/overlay` and reuses the stock
+  kernel modules, so no rebuild is needed and the first boot comes up overlay
+  directly (see provisioning, above).
+- a conf.d drop-in sets `MODULES=most` (the debian default; stock raspios uses
+  `dep`). dep mode resolves the running root device, which fails when the
+  kernel mounted root without an initramfs (`/proc/mounts` shows `/dev/root`,
+  as under the qemu harness), and most keeps the built initramfs portable.
+
+it is baked into the image by `make OVERLAY=... image` (via `toolbox/build-image`),
+which provisions the stock image unprivileged with libguestfs (`guestfish`) -- no
+loop-mount, no sudo. it carves the persist partition offline, applies `rootfs/`,
+and bakes the user offline (renaming the stock uid-1000 template user). because the
+user is pre-baked, it also finalizes the first-boot user setup the way raspios'
+`cancel-rename` would -- masking `userconfig.service` (which otherwise hangs at a
+`whiptail` username prompt on tty8, blocking `multi-user.target`) and dropping the
+ssh "set up a valid user" banner -- and masks the redundant `systemd-networkd`
+(raspios ships it alongside NetworkManager, which owns our interfaces, so
+`networkd-wait-online` only times out and reports `degraded`). then -- for
+`OVERLAY` images -- it patches the stock initramfs offline:
+`unmkinitramfs` extracts the concatenated cpio, the `/scripts/overlay` premount is
+added, and it is repacked as one uncompressed cpio. the kernel auto-loads that
+initramfs on real hardware, so the first boot comes up overlay directly -- no
+on-device initramfs build and no reboot. the cmdline gets `boot=overlay
+overlay-upper=<shape>` (and the stock ` resize` token is stripped). the result is
+a sparse raw image that flashes directly with no manual steps.
+
+  on the first boot `overlay-firstboot.service` grows persist online to fill the
+  card and (tmpfs shape only) seeds the persisted identity. persist is the last
+  partition and the live overlay upper, so it is both mounted and busy: parted
+  and BLKRRPART cannot re-read a busy disk's table, so `grow-persist` rewrites the
+  trailing partition with `sfdisk --no-reread`, applies the new size in-kernel with
+  `partx -u` (a BLKPG resize works on an in-use partition), then grows the fs online
+  with `resize2fs` via its mountpoint -- the initramfs bind-mounts persist into the
+  booted root so resize2fs can reach it. no data is moved and no reboot is needed.
+  the stock `systemd-growfs-root.service` is masked for overlay images (it cannot
+  grow an overlay root); a plain (non-`OVERLAY`) image keeps the stock raspios
+  resize, which grows root instead.
+
+  the service ships inert in `rootfs/` (no wants symlink) and is enabled only for
+  `OVERLAY` images. it orders only after `regenerate_ssh_host_keys.service` so the
+  tmpfs seed captures real host keys, and deliberately depends on nothing in the
+  network path, which would otherwise queue it behind the network-online timeout.
+
+a dedicated third partition (ext4, label `persist`) is carved from a shrunk
+rootfs and holds everything that must survive a reboot. two upper-layer shapes
+are supported, selected at provision time:
+
+- **ephemeral** (default): upper is tmpfs (reboot = clean slate, power-safe --
+  the disk is read-only in normal operation). identity (ssh host keys,
+  `machine-id`, NetworkManager connections, `/home`) is bind-mounted from the
+  `persist` partition so it survives reboots automatically. other changes can be
+  made durable on demand with `toolbox/overlay-commit`: it stages the live tmpfs
+  upper onto `persist` and reboots; the initramfs folds the staged delta into a
+  committed layer (`persist/data`). that layer is the UPPER of an inner overlay
+  over the base (`base + persist/data -> /committed`), with the tmpfs upper
+  stacked above it (`/committed + tmpfs -> /`). because the committed layer is an
+  overlay upper, whiteouts apply, so additions, modifications AND deletions all
+  persist. the disk is only written during a commit, and `persist` (the big
+  card-filling partition) is the commit target so size is not a constraint.
+  volatile paths (the swapfile, `/var/log`, `/var/cache`, `/var/tmp`, `/tmp`) are
+  excluded from a commit so it captures meaningful state, not churn.
+- **persistent**: upper is the `persist` partition itself, so all changes
+  survive immediately (reboot is no longer a reset, writes accumulate on `persist`).
+
+the read-only-boot fstab option (`defaults,ro` on the firmware partition) is
+mutually exclusive with `boot=overlay` in `raspi-config` and is applied only
+when overlay root is not in use.
+
+## factory reset (implemented)
+
+at provision time a pristine snapshot of the persisted state is baked onto the
+`persist` partition (`/persist/factory/`). a soft reset is a reboot (the tmpfs
+upper is discarded, ephemeral shape only); a hard reset wipes the live
+persisted state, restores the factory snapshot, regenerates ssh host keys and
+`machine-id`, and reboots. triggers:
+
+- a flag file on the FAT firmware partition (`/boot/firmware/factory-reset`),
+  settable from any machine even when the device is unreachable
+- a GPIO button held at boot (opt-in; not enabled by default, and requires a
+  sustained hold so a floating pin cannot trigger a reset loop)
+- `make factory-reset` over ssh
+
+## virtual test environment
+
+the goal is a scripted environment as close to real RPi4 hardware as feasible.
+it lives entirely under `tests/` and is driven by `make test`.
+
+### why QEMU raspi4b
+
+QEMU (>= 9.0) models a `raspi4b` machine that boots the genuine Raspberry Pi OS
+arm64 image with the real kernel, dtb, and rootfs. this gives high fidelity for
+the boot flow, the provisioning overlay, and SSH bring-up. we run it on arm64
+under TCG (no KVM on an x86 host) to match the target architecture.
+
+### fidelity tradeoffs
+
+QEMU does not model all of the RPi4 SoC. the consequences:
+
+| feature           | real RPi4         | QEMU raspi4b        | tested here |
+|-------------------|-------------------|---------------------|-------------|
+| boot + rootfs     | real              | real image          | yes         |
+| USB host mode     | dwc2 host         | dwc2 host (modeled) | yes         |
+| USB gadget (usb0) | dwc2 device       | gadget regs stubbed | no (deferred) |
+| wifi (wlan0)      | brcmfmac          | not emulated        | no (deferred) |
+| on-SoC ethernet   | GENET             | not emulated        | no          |
+
+the harness drives the guest over the serial console, not SSH, so it needs no
+guest networking: single-boot scenarios assert against a report block an in-guest
+service prints to the console, and multi-boot scenarios (factory-reset) drive it
+interactively with `tests/lib/serial.py`.
+
+USB host mode needs a dtb patch: because qemu bypasses the firmware, the image's
+`dtoverlay=dwc2` never applies, and the stock dtb leaves `/soc/usb@7e980000`
+disabled with the legacy `brcm,bcm2708-usb` binding no mainline driver claims.
+`patch_dtb_for_qemu` (in `tests/lib/qemu.sh`) rewrites the extracted dtb with
+`fdtput` (compatible `snps,dwc2`, `dr_mode host`, `status okay`) so the kernel's
+dwc2 host driver binds and attached usb devices enumerate.
+
+### deferred features and their known approach
+
+- **gadget mode**: QEMU's dwc2 gadget registers are stubbed, so `g_ether`/`usb0`
+  cannot come up. the known path is to build the out-of-tree `dummy_hcd` module
+  (absent from the raspios kernel) and package it via DKMS, then bring up `usb0`
+  on the real kernel inside the guest.
+- **wifi hotspot**: QEMU emulates no wifi. the known path is `mac80211_hwsim`,
+  which creates virtual radios supporting AP/station mode -- but it is not in the
+  raspios kernel, so it requires a generic-kernel lane.
+
+both are recorded in ROADMAP.
+
+### harness structure
+
+the harness is fully root-free -- it builds the real image with `make image` and
+boots the artifact; no loop-mount, no sudo.
+
+- the serial console: under qemu raspi4b the kernel console lands on the aux
+  mini-uart (`ttyS0`, qemu's second `-serial`) because bluetooth owns the PL011
+  (`ttyAMA0`). the harness sets `console=ttyS0,115200` and captures `serial_hd(1)`.
+- `tests/lib/image-boot.sh` -- prepare a built `make [OVERLAY=...] image` for qemu:
+  with `guestfish` it injects the report service into a work copy of the image and
+  extracts kernel/dtb/cmdline (+ the offline-patched initramfs for overlay images;
+  a plain image boots its ext4 root directly)
+- `tests/lib/qemu.sh`    -- launch raspi4b with the extracted kernel/dtb/image (and
+  optional USB devices). `patch_dtb_for_qemu` enables dwc2 host mode and disables
+  the watchdog node; `QEMU_SERIAL_SOCK`/`QEMU_QMP` + `qmp_quit` enable multi-boot tests
+- `tests/lib/serial.py`  -- drive the serial console for multi-boot scenarios: wait
+  for login, log in, prime sudo, run a piped script (used by factory-reset)
+- `tests/lib/wait.sh`    -- poll the console log for the report-end marker
+- `tests/image-e2e/`     -- the in-guest report service injected at test time
+- `tests/scenarios/`     -- the checks: `image-e2e.sh` (`make test-e2e
+  MODE=plain|persist|tmpfs`: build + boot, assert provisioning -- writable ext4
+  root for plain, or overlay root + baked user + online persist grow for overlay),
+  `usb-host.sh` (usb mass-storage enumeration), `factory-reset.sh` (multi-boot: the
+  reset reverts the overlay upper to the read-only base)
+
+work artifacts (the work copy of the card, extracted kernel/dtb/initramfs, console
+logs) live in `tests/.work/` and are gitignored (`make test-clean` removes them).
+each test builds a fresh image and boots it; the first boot is slow under TCG (the
+image expands and provisions), so a run is a few minutes per mode.

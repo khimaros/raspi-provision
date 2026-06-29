@@ -1,0 +1,33 @@
+#!/bin/bash
+# headless factory-reset trigger: if the reset button is HELD to ground for a
+# few seconds at boot, request a factory reset. opt-in -- enable on hardware
+# with 'systemctl enable factory-reset-button'; it is deliberately not enabled
+# by default (and never in the qemu tests, where the emulated gpio has no
+# pull-up and would read a permanent press). the button wires a gpio line to
+# ground; with the internal pull-up it reads 0 when pressed. the sustained-hold
+# requirement means a floating or glitching pin cannot trigger a reset loop.
+# pin/chip/hold are overridable via the environment.
+set -uo pipefail
+
+GPIO_CHIP="${RESET_GPIO_CHIP:-gpiochip0}"
+GPIO_LINE="${RESET_GPIO_LINE:-21}"
+HOLD_SECS="${RESET_HOLD_SECS:-3}"
+
+command -v gpioget >/dev/null || { echo "gpioget not installed; skipping" >&2; exit 0; }
+
+# true only on an unambiguous logic-low read; a read error counts as not-low.
+read_low() {
+	local out
+	out="$(gpioget --numeric --bias=pull-up -c "$GPIO_CHIP" "$GPIO_LINE" 2>/dev/null \
+		|| gpioget --bias=pull-up -c "$GPIO_CHIP" "$GPIO_LINE" 2>/dev/null \
+		|| gpioget -B pull-up "$GPIO_CHIP" "$GPIO_LINE" 2>/dev/null)" || return 1
+	case "${out##*[ =]}" in 0|inactive) return 0 ;; *) return 1 ;; esac
+}
+
+# require the line held low for the whole window; any high/error read aborts.
+end=$((SECONDS + HOLD_SECS))
+while [ "$SECONDS" -lt "$end" ]; do
+	read_low || exit 0
+	sleep 0.5
+done
+exec /usr/local/sbin/factory-reset

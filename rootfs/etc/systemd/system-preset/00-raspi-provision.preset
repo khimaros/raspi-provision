@@ -1,0 +1,5 @@
+# the factory-reset GPIO button is opt-in hardware (enable on a real device with
+# 'systemctl enable factory-reset-button'). keep it disabled by default so the
+# first-boot preset pass does not turn it on -- otherwise a floating or emulated
+# GPIO that reads low looks like a held button and triggers a factory reset.
+disable factory-reset-button.service

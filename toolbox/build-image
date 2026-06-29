@@ -1,0 +1,228 @@
+#!/bin/bash
+# build a flashable, provisioned raspios image OFFLINE and UNPRIVILEGED via
+# libguestfs: guestfish edits the image's filesystems through a real kernel mount
+# in a user-mode appliance (no loop mount, no root), so modern ext4 features and
+# stock file capabilities are preserved. the user account is baked in offline (no
+# first-boot userconf). with OVERLAY set, carves a persist partition and patches
+# the stock initramfs so the first boot comes up overlay directly.
+#
+# usage: build-image <src.img.xz> <out.img> [tmpfs|persist]
+
+set -euo pipefail
+
+SRC="${1:?usage: build-image <src.img.xz> <out.img> [tmpfs|persist]}"
+OUT="${2:?usage: build-image <src.img.xz> <out.img> [tmpfs|persist]}"
+MODE="${3:-}"
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PERSIST_SIZE_MIB="${PERSIST_SIZE_MIB:-128}"
+CUSTOM_HOSTNAME="${CUSTOM_HOSTNAME:?CUSTOM_HOSTNAME must be set}"
+CUSTOM_USERNAME="${CUSTOM_USERNAME:?CUSTOM_USERNAME must be set}"
+CUSTOM_PASSWORD="${CUSTOM_PASSWORD:?CUSTOM_PASSWORD must be set}"
+FIRST_USER_UID=1000
+# supplementary groups the first raspios user belongs to (hardware + admin).
+USER_GROUPS="adm dialout cdrom sudo audio video plugdev games users input render netdev gpio i2c spi"
+OVERLAY_SCRIPT="$REPO/rootfs/etc/initramfs-tools/scripts/overlay"
+export PATH="$PATH:/usr/sbin:/sbin"
+
+case "$MODE" in ""|tmpfs|persist) ;; *) echo "overlay-mode must be tmpfs, persist, or empty" >&2; exit 1 ;; esac
+[ -f "$SRC" ] || { echo "source image not found: $SRC" >&2; exit 1; }
+for t in guestfish tar cpio unmkinitramfs sfdisk openssl; do
+	command -v "$t" >/dev/null || { echo "missing required tool: $t" >&2; exit 1; }
+done
+
+SECT=512
+MIB=$((1024 * 1024))
+mkdir -p "$(dirname "$OUT")"
+WORK="$(mktemp -d "$(cd "$(dirname "$OUT")" && pwd)/.build-XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+
+echo "decompressing $SRC -> $OUT"
+xzcat "$SRC" > "$OUT"
+
+# ---- assemble inputs for guestfish ----------------------------------------
+# rootfs overlay as tarballs with explicit ownership (root, except the user's
+# home which is the first user). tar preserves modes and symlinks.
+tar --numeric-owner --owner=0 --group=0 --exclude='./home/*' \
+    -C "$REPO/rootfs" -cf "$WORK/rootfs.tar" .
+# the template home dir under rootfs/home (any name) becomes the first user's home.
+have_home=0
+home_src="$(find "$REPO/rootfs/home" -mindepth 1 -maxdepth 1 -type d | head -1)"
+if [ -n "$home_src" ]; then
+	have_home=1
+	tar --numeric-owner --owner="$FIRST_USER_UID" --group="$FIRST_USER_UID" \
+	    -C "$home_src" -cf "$WORK/home.tar" .
+fi
+
+# the hostname goes straight to /etc/hostname; the hosts + hotspot files are sed'd
+# from templates on the host (folds the old 'make customize' into the build).
+printf '%s\n' "$CUSTOM_HOSTNAME" > "$WORK/hostname"
+cat > "$WORK/customize-files" <<EOF
+#!/bin/bash
+d="\$1"
+sed -i 's/^127\\.0\\.1\\.1.*/127.0.1.1\\t$CUSTOM_HOSTNAME/' "\$d/hosts"
+sed -i 's/^ssid=.*/ssid=$CUSTOM_HOSTNAME/' "\$d/hotspot"
+sed -i 's/^psk=.*/psk=$CUSTOM_PASSWORD/' "\$d/hotspot"
+EOF
+chmod +x "$WORK/customize-files"
+
+# the SHA-512 hash contains '$' which must not be shell-expanded when the helper
+# runs, so pass it via a file rather than embedding it in the generated script.
+printf '%s' "$CUSTOM_PASSWORD" | openssl passwd -6 -stdin > "$WORK/hash"
+days=$(( $(date +%s) / 86400 ))
+
+# host-side helper: bake the user offline by RENAMING the stock first user (the
+# uid-1000 template raspios ships, e.g. 'pi', which userconf normally renames) to
+# our username -- with our password, home, and shell, inheriting its group
+# memberships. if the image ships no uid-1000 user, create one and add it to the
+# standard groups. operates on /etc/{passwd,shadow,group,gshadow} downloaded into
+# the directory passed as $1; run via guestfish '!' so no guest emulation needed.
+cat > "$WORK/bake-user" <<EOF
+#!/bin/bash
+set -e
+d="\$1"; u="$CUSTOM_USERNAME"; h="\$(cat "\$d/hash")"; dd="$days"; uid="$FIRST_USER_UID"
+old="\$(awk -F: -v i="\$uid" '\$3==i{print \$1; exit}' "\$d/passwd")"
+if [ -n "\$old" ] && [ "\$old" != "\$u" ]; then
+	awk -F: -v OFS=: -v o="\$old" -v u="\$u" '\$1==o{\$1=u;\$5=",,,";\$6="/home/"u;\$7="/bin/bash"}1' "\$d/passwd" > "\$d/passwd.n" && mv "\$d/passwd.n" "\$d/passwd"
+	awk -F: -v OFS=: -v o="\$old" -v u="\$u" -v h="\$h" -v dd="\$dd" '\$1==o{\$1=u;\$2=h;\$3=dd}1' "\$d/shadow" > "\$d/shadow.n" && mv "\$d/shadow.n" "\$d/shadow"
+	for f in group gshadow; do [ -f "\$d/\$f" ] || continue
+		awk -F: -v OFS=: -v o="\$old" -v u="\$u" '\$1==o{\$1=u} {n=split(\$4,m,","); s=""; for(i=1;i<=n;i++){x=(m[i]==o?u:m[i]); s=s (s==""?"":",") x} \$4=s}1' "\$d/\$f" > "\$d/\$f.n" && mv "\$d/\$f.n" "\$d/\$f"
+	done
+elif [ "\$old" != "\$u" ]; then
+	printf '%s:x:%s:%s:,,,:/home/%s:/bin/bash\n' "\$u" "\$uid" "\$uid" "\$u" >> "\$d/passwd"
+	printf '%s:%s:%s:0:99999:7:::\n' "\$u" "\$h" "\$dd" >> "\$d/shadow"
+	printf '%s:x:%s:\n' "\$u" "\$uid" >> "\$d/group"
+	for g in $USER_GROUPS; do
+		awk -F: -v OFS=: -v g="\$g" -v u="\$u" '\$1==g{if(\$4=="")\$4=u; else if(\$4!~"(^|,)"u"(,|\$)")\$4=\$4","u}1' "\$d/group" > "\$d/group.n" && mv "\$d/group.n" "\$d/group"
+	done
+fi
+EOF
+
+# host-side helper: append the provisioning cmdline tokens and, for an overlay
+# image, strip the stock resize trigger and select the upper-layer shape.
+cat > "$WORK/edit-cmdline" <<EOF
+#!/bin/bash
+cmd="\$(tr -d '\r\n' < "\$1")"
+for tok in "cfg80211.ieee80211_regdom=US" "modules-load=dwc2,g_ether" \\
+           "g_ether.dev_addr=12:22:33:44:55:66 g_ether.host_addr=16:22:33:44:55:66"; do
+	grep -qF "\${tok%% *}" <<<"\$cmd" || cmd="\$cmd \$tok"
+done
+if [ -n "$MODE" ]; then
+	cmd="\$(sed -E 's/(^| )resize( |\$)/ /g' <<<"\$cmd" | tr -s ' ')"
+	cmd="boot=overlay \$cmd overlay-upper=$MODE"
+fi
+printf '%s\n' "\$cmd" > "\$1"
+EOF
+
+# host-side helper: add our /scripts/overlay to a stock (uncompressed cpio)
+# initramfs so 'boot=overlay' uses it; reuses the matching stock initramfs.
+cat > "$WORK/patch-initramfs" <<EOF
+#!/bin/bash
+set -e
+d="\$(mktemp -d "$WORK/ird-XXXXXX")"
+# the stock initramfs is a concatenation of cpio archives (only unmkinitramfs
+# reads all of them; plain cpio sees just the first). extract the full tree, add
+# our premount script, repack as one uncompressed cpio the kernel accepts.
+unmkinitramfs "\$1" "\$d"
+root="\$d"; [ -f "\$root/init" ] || root="\$(dirname "\$(find "\$d" -name init -path '*/init' -type f | head -1)")"
+install -Dm755 "$OVERLAY_SCRIPT" "\$root/scripts/overlay"
+( cd "\$root" && find . | cpio -o -H newc --quiet -R 0:0 ) > "\$2"
+rm -rf "\$d"
+EOF
+chmod +x "$WORK"/bake-user "$WORK"/edit-cmdline "$WORK"/patch-initramfs
+
+# ---- partition geometry / persist sizing ----------------------------------
+part_cmds=""
+if [ -n "$MODE" ]; then
+	geom="$(sfdisk -d "$OUT")"
+	p2_line="$(printf '%s\n' "$geom" | grep "start=" | sed -n 2p)"
+	p2_start=$(sed -E 's/.*start=[[:space:]]*([0-9]+).*/\1/' <<<"$p2_line")
+	p2_size=$(sed -E 's/.*size=[[:space:]]*([0-9]+).*/\1/' <<<"$p2_line")
+	p3_start=$(( ( (p2_start + p2_size + 2047) / 2048 ) * 2048 ))
+	p3_sectors=$(( PERSIST_SIZE_MIB * MIB / SECT ))
+	p3_end=$(( p3_start + p3_sectors - 1 ))
+	truncate -s $(( (p3_end + 1) * SECT )) "$OUT"
+	# reserve GDT for online growth (resize2fs grows persist while it is mounted
+	# as the overlay upper); maxonlineresize ~2TiB covers any card. drop the 5%
+	# root reserve -- persist is a data store.
+	part_cmds="part-add /dev/sda p $p3_start $p3_end
+mke2fs /dev/sda3 fstype:ext4 label:persist blocksize:4096 maxonlineresize:536870912 reservedblockspercentage:0"
+fi
+
+# ---- one guestfish session ------------------------------------------------
+echo "provisioning image with guestfish (mode=${MODE:-plain})"
+{
+	echo "run"
+	[ -n "$part_cmds" ] && echo "$part_cmds"
+	echo "mount /dev/sda2 /"
+	echo "tar-in $WORK/rootfs.tar /"
+	if [ "$have_home" = 1 ]; then
+		echo "mkdir-p /home/$CUSTOM_USERNAME"
+		echo "chown $FIRST_USER_UID $FIRST_USER_UID /home/$CUSTOM_USERNAME"
+		echo "tar-in $WORK/home.tar /home/$CUSTOM_USERNAME"
+	fi
+	echo "download /etc/passwd $WORK/passwd"
+	echo "download /etc/shadow $WORK/shadow"
+	echo "download /etc/group $WORK/group"
+	echo "-download /etc/gshadow $WORK/gshadow"
+	echo "! $WORK/bake-user $WORK"
+	echo "upload $WORK/passwd /etc/passwd"
+	echo "chmod 0644 /etc/passwd"
+	echo "upload $WORK/shadow /etc/shadow"
+	echo "chmod 0640 /etc/shadow"
+	echo "chown 0 42 /etc/shadow"
+	echo "upload $WORK/group /etc/group"
+	echo "chmod 0644 /etc/group"
+	echo "-upload $WORK/gshadow /etc/gshadow"
+	echo "-chmod 0640 /etc/gshadow"
+	echo "-chown 0 42 /etc/gshadow"
+	[ "$CUSTOM_USERNAME" != pi ] && echo "rm-rf /home/pi"
+	# the user is baked offline, so finalize the stock first-boot user setup the way
+	# cancel-rename would: drop the ssh 'set up a valid user' banner drop-in.
+	# userconfig.service itself is masked via rootfs; without these the banner shows
+	# on every login and the wizard hangs on tty8 waiting for a username.
+	echo "rm-f /etc/ssh/sshd_config.d/rename_user.conf"
+	# bake hostname + hotspot identity from CUSTOM_* (folds the old make customize).
+	echo "upload $WORK/hostname /etc/hostname"
+	echo "download /etc/hosts $WORK/hosts"
+	echo "download /etc/NetworkManager/system-connections/shared-hotspot.nmconnection $WORK/hotspot"
+	echo "! $WORK/customize-files $WORK"
+	echo "upload $WORK/hosts /etc/hosts"
+	echo "upload $WORK/hotspot /etc/NetworkManager/system-connections/shared-hotspot.nmconnection"
+	echo "chmod 0600 /etc/NetworkManager/system-connections/shared-hotspot.nmconnection"
+	echo "chown 0 0 /etc/NetworkManager/system-connections/shared-hotspot.nmconnection"
+	# overlay images: install the first-boot helpers and enable the oneshot that
+	# grows persist (+ seeds identity for tmpfs) on the first overlay boot.
+	if [ -n "$MODE" ]; then
+		echo "copy-in $REPO/toolbox/grow-persist $REPO/toolbox/seed-persist $REPO/toolbox/overlay-commit /usr/local/sbin"
+		for h in grow-persist seed-persist overlay-commit; do
+			echo "chmod 0755 /usr/local/sbin/$h"
+			echo "chown 0 0 /usr/local/sbin/$h"
+		done
+		echo "mkdir-p /etc/systemd/system/multi-user.target.wants"
+		echo "ln-s ../overlay-firstboot.service /etc/systemd/system/multi-user.target.wants/overlay-firstboot.service"
+		# the stock root-grow fails on an overlay root (it is not a growable block
+		# device); grow-persist replaces it, so mask it to keep the boot clean.
+		echo "ln-s /dev/null /etc/systemd/system/systemd-growfs-root.service"
+	fi
+	echo "mount /dev/sda1 /boot"
+	echo "copy-in $REPO/bootfs/config.txt $REPO/bootfs/ssh.txt /boot"
+	echo "download /boot/cmdline.txt $WORK/cmdline"
+	echo "! $WORK/edit-cmdline $WORK/cmdline"
+	echo "upload $WORK/cmdline /boot/cmdline.txt"
+	# overlay initramfs: patch the stock one on the host, upload it back.
+	if [ -n "$MODE" ]; then
+		for ird in initramfs8 initramfs_2712; do
+			echo "-download /boot/$ird $WORK/$ird"
+			echo "! [ -f $WORK/$ird ] && $WORK/patch-initramfs $WORK/$ird $WORK/$ird.new || true"
+			echo "-upload $WORK/$ird.new /boot/$ird"
+		done
+	fi
+	echo "umount-all"
+} > "$WORK/build.gf"
+guestfish -a "$OUT" < "$WORK/build.gf"
+
+# punch zero runs into holes so the artifact is sparse on disk.
+fallocate -d "$OUT" 2>/dev/null || true
+echo "built $OUT${MODE:+ (overlay upper=$MODE)}"
+echo "  apparent: $(du -h --apparent-size "$OUT" | cut -f1), on disk: $(du -h "$OUT" | cut -f1)"
