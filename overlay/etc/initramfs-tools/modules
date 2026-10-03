@@ -1,0 +1,5 @@
+# modules always included in the initramfs (one per line, loaded at boot).
+# overlay root (scripts/overlay) needs overlay before the root is assembled; the
+# base root only has modules for the kernel the image shipped with, so a kernel
+# update must carry overlay.ko in its own initramfs.
+overlay

@@ -15,10 +15,8 @@ build_image   # usb host mode is independent of the root overlay shape
 image_boot_prepare plain "$REPO/images/$CUSTOM_HOSTNAME.img"
 
 log "building usb mass-storage image with sentinel"
-rm -f "$USB_IMG"
-truncate -s 32M "$USB_IMG"
-mkfs.vfat -n USBHOST "$USB_IMG" >/dev/null
-printf '%s\n' "$SENTINEL" | mcopy -i "$USB_IMG" - ::SENTINEL.TXT
+printf '%s\n' "$SENTINEL" > "$WORK/SENTINEL.TXT"
+usb_disk "$USB_IMG" USBHOST "$WORK/SENTINEL.TXT"
 
 start_qemu \
   -drive "file=$USB_IMG,format=raw,if=none,id=usbdisk" \

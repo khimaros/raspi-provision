@@ -46,6 +46,21 @@ test-factory-reset: build
 	tests/scenarios/factory-reset.sh
 .PHONY: test-factory-reset
 
+# multi-boot: commit replaced/deleted/new files on tmpfs, assert the fold kept them.
+test-overlay-commit: build
+	tests/scenarios/overlay-commit.sh
+.PHONY: test-overlay-commit
+
+# multi-boot: install a newer kernel, commit, boot it from FAT, reset to the base.
+test-kernel-update: build
+	tests/scenarios/kernel-update.sh
+.PHONY: test-kernel-update
+
+# build a project whose depends/ adds a package, boot offline, assert it is installed.
+test-bake-depends: build
+	tests/scenarios/bake-depends.sh
+.PHONY: test-bake-depends
+
 # device-free: fake ssh/rsync record the maintain `update` command sequence.
 test-update: build
 	python3 tests/scenarios/maintain-update.py

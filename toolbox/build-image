@@ -29,6 +29,9 @@ OVERLAY_SCRIPT="$REPO/overlay/etc/initramfs-tools/scripts/overlay"
 # boot/firmware/ go to the FAT firmware partition, everything else to the ext4
 # root. the framework internals above stay framework-owned, not user layers.
 OVERLAY_LAYERS="${OVERLAY_LAYERS:-$REPO/overlay}"
+# where an overlay image mounts the FAT partition at runtime; keep in sync with
+# overlay/usr/local/sbin/factory-reset.
+BOOTFS_MNT=/boot/bootfs
 export PATH="$PATH:/usr/sbin:/sbin"
 
 case "$MODE" in ""|tmpfs|persist) ;; *) echo "overlay-mode must be tmpfs, persist, or empty" >&2; exit 1 ;; esac
@@ -42,9 +45,20 @@ MIB=$((1024 * 1024))
 mkdir -p "$(dirname "$OUT")"
 WORK="$(mktemp -d "$(cd "$(dirname "$OUT")" && pwd)/.build-XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
+# build under a temporary name on the same filesystem and rename at the end, so a
+# failed build leaves the previous image in place.
+FINAL="$OUT"
+OUT="$WORK/image.img"
 
-echo "decompressing $SRC -> $OUT"
+echo "decompressing $SRC -> $FINAL"
 xzcat "$SRC" > "$OUT"
+
+# install the depends/ packages into the stock root first, while root is still the
+# last partition (bake-depends grows it) and before the overlay files land on top.
+if [ "${BAKE_DEPENDS:-0}" = 1 ] && [ -n "${DEPENDS:-}" ]; then
+	# shellcheck disable=SC2086
+	APT_CACHE="$(cd "$(dirname "$FINAL")" && pwd)/.apt-cache" "$REPO/toolbox/bake-depends" "$OUT" $DEPENDS
+fi
 
 # ---- assemble inputs for guestfish ----------------------------------------
 # merge the ordered overlay layers into one staging tree (last layer wins) so a
@@ -148,7 +162,13 @@ install -Dm755 "$OVERLAY_SCRIPT" "\$root/scripts/overlay"
 ( cd "\$root" && find . | cpio -o -H newc --quiet -R 0:0 ) > "\$2"
 rm -rf "\$d"
 EOF
-chmod +x "$WORK"/bake-user "$WORK"/edit-cmdline "$WORK"/patch-initramfs
+# host-side helper: under an overlay root the FAT partition moves to BOOTFS_MNT and
+# the root's own boot/firmware copy takes its place (see scripts/overlay).
+cat > "$WORK/edit-fstab" <<EOF
+#!/bin/bash
+sed -i -E 's|^([^#][^[:space:]]*[[:space:]]+)/boot/firmware([[:space:]])|\\1$BOOTFS_MNT\\2|' "\$1"
+EOF
+chmod +x "$WORK"/bake-user "$WORK"/edit-cmdline "$WORK"/patch-initramfs "$WORK"/edit-fstab
 
 # ---- partition geometry / persist sizing ----------------------------------
 part_cmds=""
@@ -240,6 +260,16 @@ echo "provisioning image with guestfish (mode=${MODE:-plain})"
 			echo "! [ -f $WORK/$ird ] && $WORK/patch-initramfs $WORK/$ird $WORK/$ird.new || true"
 			echo "-upload $WORK/$ird.new /boot/firmware/$ird"
 		done
+		# the finished FAT contents become the root's boot/firmware (the base
+		# that firmware updates layer over and a factory reset restores from).
+		echo "umount /boot/firmware"
+		echo "mount /dev/sda1 /mnt"
+		echo "cp-a /mnt/. /boot/firmware"
+		echo "umount /mnt"
+		echo "mkdir-p $BOOTFS_MNT"
+		echo "download /etc/fstab $WORK/fstab"
+		echo "! $WORK/edit-fstab $WORK/fstab"
+		echo "upload $WORK/fstab /etc/fstab"
 	fi
 	echo "umount-all"
 } > "$WORK/build.gf"
@@ -247,5 +277,6 @@ guestfish -a "$OUT" < "$WORK/build.gf"
 
 # punch zero runs into holes so the artifact is sparse on disk.
 fallocate -d "$OUT" 2>/dev/null || true
-echo "built $OUT${MODE:+ (overlay upper=$MODE)}"
-echo "  apparent: $(du -h --apparent-size "$OUT" | cut -f1), on disk: $(du -h "$OUT" | cut -f1)"
+mv "$OUT" "$FINAL"
+echo "built $FINAL${MODE:+ (overlay upper=$MODE)}"
+echo "  apparent: $(du -h --apparent-size "$FINAL" | cut -f1), on disk: $(du -h "$FINAL" | cut -f1)"

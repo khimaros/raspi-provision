@@ -11,6 +11,9 @@ the serial console. fully root-free -- no loop-mount, no sudo. see
 make test-e2e             # build + boot, assert provisioning (MODE=plain|persist|tmpfs)
 make test-usb-host        # usb mass-storage enumeration (dwc2 host mode)
 make test-factory-reset   # multi-boot: reset reverts the overlay upper
+make test-overlay-commit  # multi-boot: tmpfs commit keeps opaque dirs, deletions, content
+make test-kernel-update   # multi-boot: commit-gated kernel upgrade, backstop, reset
+make test-bake-depends    # depends/ installed into the image at build time
 make test-update          # device-free: `update` command order via fake ssh/rsync
 make test                 # standard suite: test-update + test-e2e (persist) + test-usb-host
 make test-clean           # delete tests/.work/
@@ -28,6 +31,14 @@ config comes from `customize.env` / the Makefile defaults (hostname/user/passwor
   enumerated and a sentinel read -- the Pi acting as a usb host.
 - **factory-reset**: on a persist overlay, write a change + set the reset flag,
   reboot, and the initramfs reverts the overlay upper to the read-only base.
+- **overlay-commit**: on tmpfs, replace a base directory, delete a base file and
+  write a new one, commit, power-cycle: the fold keeps all three (the replaced
+  directory's base entries stay hidden) and drops a later uncommitted change.
+- **kernel-update**: on tmpfs, `dpkg -i` a newer rpi kernel (pinned debs fetched
+  into `images/`) from a usb disk and commit. FAT must stay untouched until the
+  commit; the next boot syncs the new kernel to FAT, and the harness then boots
+  it from FAT with `overlay.ko` stripped from its initramfs (the backstop loads
+  it from the committed layer). a factory reset restores the base kernel on FAT.
 - **update**: `raspi-provision update` pushes the overlay, refreshes apt lists,
   installs base + project depends, then full-upgrades, in that order.
 

@@ -1,0 +1,172 @@
+#!/bin/bash
+# install packages into a raspios image at build time, root-free. the host's apt
+# resolves and downloads them against the image's own sources, keyrings and dpkg
+# status (so only what the image lacks is fetched); the image then boots once
+# under qemu raspi4b with a throwaway init that replays apt's plan offline with
+# the image's dpkg and powers off. the root partition is grown first to fit, so
+# this must run while it is still the last partition (before persist is carved).
+#
+# usage: bake-depends <image> <package>...
+
+set -euo pipefail
+
+IMG="${1:?usage: bake-depends <image> <package>...}"; shift
+[ "$#" -gt 0 ] || exit 0
+export PATH="$PATH:/usr/sbin:/sbin"
+
+# apt lists and downloaded debs persist across builds (build-image passes
+# images/.apt-cache), so a rebuild downloads only what changed upstream; autoclean
+# drops debs that are no longer downloadable, which keeps the cache bounded.
+CACHE="${APT_CACHE:-$(cd "$(dirname "$IMG")" && pwd)/.apt-cache}"
+GUEST_DIR=/var/cache/raspi-provision
+BAKE_TIMEOUT="${BAKE_TIMEOUT:-3600}"
+MARKER="raspi-provision-bake: rc="
+# headroom on top of the packages' installed size for apt/dpkg working space.
+MARGIN_MIB=256
+
+for t in apt-get dpkg-deb qemu-system-aarch64 fdtput guestfish sfdisk; do
+	command -v "$t" >/dev/null || { echo "bake-depends: missing required tool: $t" >&2; exit 1; }
+done
+
+WORK="$(mktemp -d "$(dirname "$IMG")/.bake-XXXXXX")"
+QEMU_PID=
+trap '[ -n "$QEMU_PID" ] && kill "$QEMU_PID" 2>/dev/null; rm -rf "$WORK"' EXIT
+A="$CACHE/root"
+rm -rf "${A:?}/etc" "${A:?}/usr" "${A:?}/var/lib/dpkg"
+mkdir -p "$A/etc" "$A/usr/share" "$A/var/lib/dpkg" "$A/var/lib/apt/lists/partial" \
+	"$CACHE/archives/partial" "$WORK/boot"
+
+echo "bake-depends: reading apt config and boot files from the image"
+guestfish --ro -a "$IMG" <<EOF
+run
+mount-ro /dev/sda2 /
+copy-out /etc/apt $A/etc
+copy-out /usr/share/keyrings $A/usr/share
+download /var/lib/dpkg/status $A/var/lib/dpkg/status
+umount-all
+mount-ro /dev/sda1 /
+download /kernel8.img $WORK/boot/kernel8.img
+download /bcm2711-rpi-4-b.dtb $WORK/boot/dtb
+download /cmdline.txt $WORK/boot/cmdline.txt
+EOF
+# the sources name their keyrings by absolute path; point them into the copy.
+sed -i "s|/usr/share/keyrings/|$A/usr/share/keyrings/|g" "$A"/etc/apt/sources.list.d/*.sources 2>/dev/null || true
+# APT_CONFIG is read before any config dir, so the host's own apt config stays out.
+cat > "$WORK/apt.conf" <<EOF
+Dir::Etc "$A/etc/apt";
+Dir::State "$A/var/lib/apt";
+Dir::State::status "$A/var/lib/dpkg/status";
+Dir::Cache "$CACHE";
+Dir::Cache::archives "$CACHE/archives";
+Dir::Log "$WORK";
+APT::Architecture "arm64";
+APT::Architectures { "arm64"; };
+Debug::NoLocking "true";
+DPkg::Pre-Install-Pkgs "";
+EOF
+export APT_CONFIG="$WORK/apt.conf"
+echo "bake-depends: resolving $* (host apt, arm64)"
+apt-get -q update
+apt-get -q -y install --download-only "$@"
+apt-get -q autoclean
+# the simulated transaction is apt's exact plan: Inst (unpack) and Conf (configure)
+# steps in dependency order. it picks this install's debs out of a cache that
+# also holds earlier builds' (cache names encode the epoch ':' as %3a), and
+# becomes the dpkg script the guest replays, so the guest needs no resolver.
+debs=()
+: > "$WORK/plan"
+while read -r op name ver arch; do
+	f="${name}_${ver//:/%3a}_${arch}.deb"
+	if [ "$op" = Inst ]; then
+		debs+=("$CACHE/archives/$f")
+		echo "--unpack $GUEST_DIR/debs/$f" >> "$WORK/plan"
+	else
+		echo "--configure $name" >> "$WORK/plan"
+	fi
+done < <(apt-get -q -s install "$@" | sed -nE 's/^(Inst|Conf) ([^ ]+) (\[[^]]*\] )?\(([^ ]+) .*\[([^]]+)\]\).*/\1 \2 \4 \5/p')
+[ "${#debs[@]}" -gt 0 ] || { echo "bake-depends: everything already installed"; exit 0; }
+for d in "${debs[@]}"; do [ -f "$d" ] || { echo "bake-depends: missing from cache: $d" >&2; exit 1; }; done
+
+installed_kib=0
+for d in "${debs[@]}"; do installed_kib=$(( installed_kib + $(dpkg-deb -f "$d" Installed-Size) )); done
+debs_mib=$(( $(du -cm "${debs[@]}" | tail -1 | cut -f1) ))
+grow_mib=$(( installed_kib / 1024 + debs_mib + MARGIN_MIB ))
+echo "bake-depends: growing root by ${grow_mib}MiB for ${#debs[@]} packages"
+truncate -s "+${grow_mib}M" "$IMG"
+echo ', +' | sfdisk -q --no-reread --force -N 2 "$IMG"
+
+# the throwaway init: replay apt's plan with dpkg (the guest's own apt would
+# rather fetch a repo copy than use a local deb), keep services from starting,
+# power off. a failed unpack is fatal. single configure steps are best effort:
+# they exist so pre-dependencies are configured in time, but apt configures a
+# dependency cycle in one call, which only the final --configure -a can mirror.
+cat > "$WORK/bake-init" <<EOF
+#!/bin/sh
+mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev
+mount -t tmpfs tmpfs /run; mount -t tmpfs tmpfs /tmp
+mkdir -p /dev/pts; mount -t devpts devpts /dev/pts
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
+rc=0
+while read -r op arg; do
+	if [ "\$op" = --unpack ]; then
+		dpkg --force-confold --unpack "\$arg" || { rc=\$?; break; }
+	else
+		dpkg --force-confold --configure "\$arg" 2>/dev/null || true
+	fi
+done < $GUEST_DIR/plan
+[ "\$rc" = 0 ] && { dpkg --force-confold --configure -a || rc=\$?; }
+echo "$MARKER\$rc" > /dev/console
+sync; mount -o remount,ro /; sync
+echo o > /proc/sysrq-trigger
+sleep 3600
+EOF
+printf '#!/bin/sh\nexit 101\n' > "$WORK/policy-rc.d"
+chmod +x "$WORK/bake-init" "$WORK/policy-rc.d"
+# one tarball: guestfish scripts cap a command at ~64 arguments.
+tar -cf "$WORK/debs.tar" -C "$CACHE/archives" "${debs[@]##*/}"
+
+guestfish -a "$IMG" <<EOF
+run
+e2fsck-f /dev/sda2
+resize2fs /dev/sda2
+mount /dev/sda2 /
+mkdir-p $GUEST_DIR/debs
+tar-in $WORK/debs.tar $GUEST_DIR/debs
+copy-in $WORK/bake-init $WORK/plan $GUEST_DIR
+copy-in $WORK/policy-rc.d /usr/sbin
+EOF
+
+# qemu bypasses the firmware: boot the image's kernel with its root= token and the
+# throwaway init. the watchdog node is disabled because qemu 11's raspi4b resets
+# the machine when the guest touches it (qemu gitlab #3260).
+fdtput -t s "$WORK/boot/dtb" /soc/watchdog@7e100000 status disabled
+root="$(grep -o 'root=[^ ]*' "$WORK/boot/cmdline.txt")"
+console="$WORK/console.log"
+echo "bake-depends: installing in qemu raspi4b (slow under TCG; up to ${BAKE_TIMEOUT}s)"
+qemu-system-aarch64 -machine raspi4b -cpu cortex-a72 -m 2G -smp 4 \
+	-kernel "$WORK/boot/kernel8.img" -dtb "$WORK/boot/dtb" \
+	-drive "file=$IMG,format=raw,if=sd" \
+	-append "$root rootfstype=ext4 rw rootwait 8250.nr_uarts=1 console=ttyS0,115200 init=$GUEST_DIR/bake-init" \
+	-serial null -serial "file:$console" -display none -monitor none &
+QEMU_PID=$!
+deadline=$((SECONDS + BAKE_TIMEOUT))
+while ! grep -q "$MARKER" "$console" 2>/dev/null && kill -0 "$QEMU_PID" 2>/dev/null && ((SECONDS < deadline)); do
+	sleep 5
+done
+sleep 10
+kill "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null || true; QEMU_PID=
+rc="$(sed -n "s/.*$MARKER\([0-9]*\).*/\1/p" "$console" | tail -1)"
+cp "$console" "$CACHE/bake-console.log"
+if [ "$rc" != 0 ]; then
+	echo "bake-depends: install failed (rc=${rc:-timeout}); full log: $CACHE/bake-console.log" >&2
+	grep -E "^(dpkg|E):|error" "$console" >&2 || tail -n 40 "$console" >&2
+	exit 1
+fi
+
+guestfish -a "$IMG" <<EOF
+run
+mount /dev/sda2 /
+rm-rf $GUEST_DIR
+rm-f /usr/sbin/policy-rc.d
+EOF
+echo "bake-depends: installed ${#debs[@]} packages"

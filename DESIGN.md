@@ -20,6 +20,30 @@ partition, and bakes the per-device bits (hostname/user/password/hotspot) from t
 its own `overlay/` + `depends/` + `customize.env` and reuses the same binary, so
 the framework stays a dependency rather than a fork.
 
+`depends/` packages (base + project) are installed at build time by
+`toolbox/bake-depends`, before the overlay is applied. maintainer scripts are
+arm64 and a root-free build cannot chroot, so the work splits in two:
+
+- the host's `apt-get` resolves and downloads, driven entirely by `APT_CONFIG`
+  pointing at a copy of the image's own sources, keyrings and dpkg status (so it
+  fetches only what the image lacks, at arm64). lists and debs persist in
+  `images/.apt-cache` and `autoclean` bounds the cache. apt's simulated
+  transaction is its exact plan (unpack/configure steps in dependency order):
+  it selects this build's debs from the cache and becomes a dpkg script.
+- the root partition grows by the debs' installed size plus margin (still the
+  last partition, before persist is carved), the debs go in as one tarball
+  (guestfish script commands cap at ~64 arguments), and the image boots once
+  under qemu raspi4b with `init=` a throwaway script that replays the plan with
+  the image's `dpkg`, then `dpkg --configure -a` (a `policy-rc.d` keeps services
+  from starting), remounts root read-only and powers off. the guest's own apt is
+  not used: with the image's package lists it prefers fetching a repo copy over
+  a local deb of the same version. the host
+  waits for its console marker. qemu bypasses the firmware, so the image's kernel
+  and dtb are passed directly, with the dtb's watchdog disabled (see fidelity
+  tradeoffs).
+
+`BAKE_DEPENDS=0` skips this; `update` then installs them on the device.
+
 connectivity is provided by three NetworkManager `shared` connections, each on
 its own subnet so they can coexist:
 
@@ -66,9 +90,12 @@ root mounts read-only under an overlayfs. this follows the same mechanism
 
 - an initramfs premount script at `/etc/initramfs-tools/scripts/overlay`
   mounts the real root read-only at `/lower`, mounts an upper, and stacks them
-  as `overlay` on the real root mount. `overlay` is added to
-  `/etc/initramfs-tools/modules`. these two files are static and ship in
-  `overlay/`.
+  as `overlay` on the real root mount. `overlay` is listed in
+  `/etc/initramfs-tools/modules` so any initramfs regenerated on device (a kernel
+  update) carries `overlay.ko`. these two files are static and ship in
+  `overlay/`. the stock initramfs lacks the module, so the premount falls back to
+  the base root's module tree, then to the writable layer's (after a committed
+  kernel update the running kernel's modules exist only there).
 - on the FAT firmware partition, `config.txt` gets `initramfs initrd.img-<KERN>-overlay`
   and `cmdline.txt` is prefixed with `boot=overlay`.
 - the initramfs is kernel-version-bound. rather than rebuild it on device, the
@@ -125,8 +152,12 @@ are supported, selected at provision time:
   `machine-id`, NetworkManager connections, `/home`) is bind-mounted from the
   `persist` partition so it survives reboots automatically. other changes can be
   made durable on demand with `toolbox/overlay-commit`: it stages the live tmpfs
-  upper onto `persist` and reboots; the initramfs folds the staged delta into a
-  committed layer (`persist/data`). that layer is the UPPER of an inner overlay
+  upper onto `persist` (`rsync -aHAX`, keeping whiteouts and opaque-dir xattrs)
+  and reboots; the initramfs folds the staged delta into a committed layer
+  (`persist/data`). the fold moves entries by rename within `persist`, merging
+  directories unless they are opaque, so xattrs survive and no file data is
+  rewritten; the pending flag is cleared only after a `sync`, so a power cut
+  mid-fold resumes on the next boot. that layer is the UPPER of an inner overlay
   over the base (`base + persist/data -> /committed`), with the tmpfs upper
   stacked above it (`/committed + tmpfs -> /`). because the committed layer is an
   overlay upper, whiteouts apply, so additions, modifications AND deletions all
@@ -141,6 +172,33 @@ the read-only-boot fstab option (`defaults,ro` on the firmware partition) is
 mutually exclusive with `boot=overlay` in `raspi-config` and is applied only
 when overlay root is not in use.
 
+### kernel and firmware updates under an overlay root
+
+the raspi-firmware kernel hooks copy each new kernel, initramfs and dtb onto the
+FAT partition, which sits outside the overlay. left live, an apt upgrade would
+switch the boot kernel at once while its modules stay in the volatile upper (an
+uncommitted reboot, or a factory reset, then boots a kernel with no modules). so
+an overlay image makes the FAT a derived artifact of the root:
+
+- the build copies the finished FAT contents into the root's `/boot/firmware`
+  (the base) and remounts the FAT at `/boot/bootfs` via fstab. the premount
+  bind-mounts the root's `/boot/firmware` onto itself, because the hooks refuse
+  to write anywhere that is not a mountpoint.
+- kernel and firmware writes land in the writable layer like any other change:
+  volatile until `overlay-commit` on tmpfs, durable at once on persist.
+- on every boot the premount compares each `boot/firmware` path the durable
+  writable layer touched against FAT, copies what differs, deletes what it
+  whites out (`firmware_sync`). when a file the firmware loads changed (kernels,
+  initramfs, dtbs/overlays, `config.txt`, `cmdline.txt`, firmware blobs) it
+  reboots: the running kernel is still the old one, so the reboot is what
+  switches kernels. other files just sync, e.g. the first-boot deletion of the
+  `ssh.txt` trigger. a no-op sync costs one `cmp` per changed file.
+- a factory reset first writes the base's version of every path the discarded
+  layer touched back to FAT, then reboots into the base kernel.
+
+files edited directly on the card's FAT from another machine stay as they are
+unless the device has its own changed copy of the same path, which wins.
+
 ## factory reset (implemented)
 
 at provision time a pristine snapshot of the persisted state is baked onto the
@@ -149,8 +207,8 @@ upper is discarded, ephemeral shape only); a hard reset wipes the live
 persisted state, restores the factory snapshot, regenerates ssh host keys and
 `machine-id`, and reboots. triggers:
 
-- a flag file on the FAT firmware partition (`/boot/firmware/factory-reset`),
-  settable from any machine even when the device is unreachable
+- a flag file `factory-reset` on the FAT firmware partition (`/boot/bootfs` on
+  an overlay image), settable from any machine even when the device is unreachable
 - a GPIO button held at boot (opt-in; not enabled by default, and requires a
   sustained hold so a floating pin cannot trigger a reset loop)
 - `raspi-provision factory-reset` over ssh

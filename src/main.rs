@@ -25,6 +25,7 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("MOUNT_DEVICE", "/dev/sda"),
     ("ADDRESS", "10.55.0.1"),
     ("PERSIST_SIZE_MIB", "128"),
+    ("BAKE_DEPENDS", "1"),
     ("IMAGE_RASPIOS", "./images/raspios-lite.img.xz"),
     ("IMAGE_RASPIOS_SOURCE", "https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2026-06-19/2026-06-18-raspios-trixie-arm64-lite.img.xz"),
 ];
@@ -41,6 +42,10 @@ const INIT_CUSTOMIZE_ENV: &str = "\
 # overlay root: persist (changes survive) or tmpfs (clean slate each boot).
 # leave unset for a plain writable image.
 #OVERLAY=persist
+
+# install depends/ packages into the image at build time (needs internet, apt-get
+# and qemu-system-aarch64 on the build host). 0 leaves them to `update`.
+#BAKE_DEPENDS=1
 
 # the sdcard device that `raspi-provision flash` writes -- destructive, mind it.
 #MOUNT_DEVICE=/dev/sda
@@ -235,6 +240,11 @@ fn read_depends(dirs: &[PathBuf]) -> Vec<String> {
     out
 }
 
+// the bundled base package lists, then the project's own.
+fn depends(fw: &Path) -> Vec<String> {
+    read_depends(&[fw.join("depends"), PathBuf::from("depends")])
+}
+
 // ---- build / flash --------------------------------------------------------
 
 fn init(dir: PathBuf) -> R {
@@ -270,6 +280,7 @@ fn image() -> R {
         cmd.env(k, v);
     }
     cmd.env("OVERLAY_LAYERS", layer_list(&fw, "overlay"));
+    cmd.env("DEPENDS", depends(&fw).join(" "));
     run(cmd)
 }
 
@@ -319,7 +330,7 @@ fn update() -> R {
         run(rsync)?;
     }
     run(ssh_cmd(&c, true, false, &["apt-get", "update"]))?;
-    let pkgs = read_depends(&[fw.join("depends"), PathBuf::from("depends")]);
+    let pkgs = depends(&fw);
     if !pkgs.is_empty() {
         let mut apt = ssh_cmd(&c, true, false, &["apt-get", "-y", "install"]);
         apt.args(&pkgs);

@@ -21,10 +21,10 @@ start_qemu
 out1="$(drive <<'GUEST'
 for i in $(seq 1 30); do [ "$(systemctl is-active overlay-firstboot 2>/dev/null)" = activating ] || break; sleep 5; done
 echo RESETME | sudo tee /etc/factory-test-marker >/dev/null
-sudo touch /boot/firmware/factory-reset
+sudo touch /boot/bootfs/factory-reset
 sync
 echo "B1_MARKER=$(cat /etc/factory-test-marker 2>/dev/null || echo none)"
-echo "B1_FLAG=$(test -e /boot/firmware/factory-reset && echo set || echo missing)"
+echo "B1_FLAG=$(test -e /boot/bootfs/factory-reset && echo set || echo missing)"
 GUEST
 )"
 grep -aE '^B1_' <<<"$out1" >&2
@@ -34,7 +34,7 @@ log "boot 2: factory_reset ran in the initramfs; verify the change is gone"
 start_qemu
 out2="$(drive <<'GUEST'
 echo "B2_MARKER=$(cat /etc/factory-test-marker 2>/dev/null || echo GONE)"
-echo "B2_FLAG=$(test -e /boot/firmware/factory-reset && echo STILL_SET || echo cleared)"
+echo "B2_FLAG=$(test -e /boot/bootfs/factory-reset && echo STILL_SET || echo cleared)"
 echo "B2_ROOT=$(findmnt -no FSTYPE /)"
 GUEST
 )"

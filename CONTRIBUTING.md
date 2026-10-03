@@ -13,7 +13,7 @@ framework itself.
   `boot/firmware/` go to the FAT firmware partition, everything else to the ext4
   root. a downstream project layers its own `overlay/` on top (last-writer-wins)
 - `depends/` -- base package lists installed by `update` (one per line, # comments)
-- `toolbox/` -- the offline build engine (`build-image`) and on-device helpers
+- `toolbox/` -- the offline build engine (`build-image`, `bake-depends`) and on-device helpers
   (`grow-persist`, `seed-persist`, `overlay-commit`)
 - `tests/` -- the root-free qemu harness (see [tests/README.md](tests/README.md))
 
@@ -41,6 +41,13 @@ scenarios read `CUSTOM_*` from the environment.
   reads its sentinel (dwc2 host mode)
 - `make test-factory-reset` -- write a change, set the reset flag, reboot, assert
   the initramfs reverted it (persist overlay, multi-boot)
+- `make test-overlay-commit` -- tmpfs: commit a replaced dir, a deletion and a
+  new file, power-cycle, assert the initramfs fold kept them
+- `make test-kernel-update` -- tmpfs: install a newer kernel deb, commit, assert
+  FAT follows only after the commit, the new kernel boots, a reset restores the base
+- `make test-bake-depends`  -- build a throwaway project (via `-C`) whose
+  `depends/` adds a package, boot offline, assert it and the base packages are in.
+  the other scenarios build with `BAKE_DEPENDS=0` to stay fast
 - `make test-update`        -- device-free: fake `ssh`/`rsync` record the `update`
   command sequence and assert apt lists refresh before the depends install
 - `make test`               -- the standard pre-commit suite: `test-update` +
@@ -53,7 +60,9 @@ integration tests over unit tests.
 ### prerequisites
 
 - a rust toolchain (pinned to 1.95 via `.mise.toml`; `mise install` provides it)
-- `qemu-system-aarch64` >= 11 (provides the `raspi4b` machine)
+- `qemu-system-aarch64` >= 11 (provides the `raspi4b` machine; also used by
+  `image` to install `depends/`)
+- `apt-get` + `dpkg-deb` (host-side download of `depends/` for the image)
 - `libguestfs-tools` (`image` and the tests build/inspect images via guestfish)
 - `dtc` (device-tree-compiler); `mtools` + `dosfstools` (for the usb-host test);
   `rsync`, `xz-utils`, `curl`

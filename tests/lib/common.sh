@@ -28,6 +28,9 @@ QEMU_PIDFILE="$WORK/qemu.pid"
 export CUSTOM_HOSTNAME="${CUSTOM_HOSTNAME:-elysium}"
 export CUSTOM_USERNAME="${CUSTOM_USERNAME:-elysium}"
 export CUSTOM_PASSWORD="${CUSTOM_PASSWORD:-elysium9}"
+# baking depends adds a long qemu install to every build; only the bake-depends
+# scenario turns it on.
+export BAKE_DEPENDS="${BAKE_DEPENDS:-0}"
 
 # the scenarios build images through the raspi-provision binary; prefer the debug
 # build (what `make build` produces), falling back to the release build.

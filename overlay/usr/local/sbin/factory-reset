@@ -1,11 +1,15 @@
 #!/bin/bash
 # request a factory reset: drop the flag on the FAT boot partition and reboot.
 # the reset itself runs from the initramfs on the next boot (see
-# rootfs/etc/initramfs-tools/scripts/overlay), so it works regardless of the
+# overlay/etc/initramfs-tools/scripts/overlay), so it works regardless of the
 # overlay upper-layer shape. the flag can also be created from any other
-# machine by touching /boot/firmware/factory-reset on the sdcard.
+# machine by touching factory-reset on the sdcard's boot partition.
 set -euo pipefail
-touch /boot/firmware/factory-reset
+# overlay images mount the FAT at /boot/bootfs (their /boot/firmware is a copy in
+# the root); plain images mount it at /boot/firmware.
+BOOTFS=/boot/bootfs
+mountpoint -q "$BOOTFS" || BOOTFS=/boot/firmware
+touch "$BOOTFS/factory-reset"
 sync
 echo "factory reset requested; rebooting"
 exec systemctl reboot

@@ -19,6 +19,10 @@ PERSIST=/persist
 LIVE_UPPER="$PERSIST/live-upper/data"
 STAGING="$PERSIST/staging/data"
 FLAG="$PERSIST/.commit-pending"
+# bind-mounted from persist/state, so they persist without a commit; any copy in
+# the live upper predates the bind and would only be hidden by it. keep in sync
+# with toolbox/seed-persist (PERSIST_PATHS).
+STATE_PATHS=(etc/ssh etc/NetworkManager/system-connections var/lib/NetworkManager home etc/machine-id)
 
 [ "$(id -u)" -eq 0 ] || { echo "overlay-commit: must run as root (use sudo)"; exit 1; }
 
@@ -39,6 +43,7 @@ mkdir -p "$STAGING"
 rsync -aHAX \
 	--exclude='/var/swap' \
 	--exclude='/var/log' --exclude='/var/cache' --exclude='/var/tmp' --exclude='/tmp' \
+	"${STATE_PATHS[@]/#/--exclude=/}" \
 	"$LIVE_UPPER/" "$STAGING/"
 sync
 touch "$FLAG"

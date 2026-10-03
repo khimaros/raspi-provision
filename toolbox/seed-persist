@@ -32,5 +32,14 @@ done
 
 # capture the pristine snapshot once, at first seed.
 [ -f "$FACTORY_TAR" ] || tar -C "$STATE" -cf "$FACTORY_TAR" .
+
+# the initramfs binds state only from the second boot on. bind it now too, so the
+# rest of the first boot (e.g. a wifi connection made with nmtui) writes to state
+# rather than the volatile upper, where a commit would bury it under the bind.
+for p in "${PERSIST_PATHS[@]}"; do
+	[ -e "$STATE/$p" ] || continue
+	findmnt -rn --mountpoint "/$p" >/dev/null && continue
+	mount --bind "$STATE/$p" "/$p"
+done
 sync
 echo "persist seeded at $PERSIST_MNT (factory snapshot: $FACTORY_TAR)"

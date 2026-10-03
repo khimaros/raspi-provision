@@ -4,7 +4,7 @@
 # the script can use plain `sudo`, then run the shell script piped on stdin and print
 # everything it emits. the script prints its own markers; scenarios assert on the
 # output. usage: serial.py <socket> <user> <password> [login-timeout-seconds]
-import socket, sys, time, re
+import os, socket, sys, time, re
 
 sock, user, pw = sys.argv[1], sys.argv[2], sys.argv[3]
 login_to = int(sys.argv[4]) if len(sys.argv) > 4 else 720
@@ -54,6 +54,6 @@ B[0] = ""
 # contains the $(()) form) cannot match the wait pattern (which sees only output).
 s.sendall(b"bash <<'EOSCRIPT'\n" + script.encode() + b"\nEOSCRIPT\n")
 s.sendall(b"echo SERIALDONE$((99))\n")
-if not wait(r"SERIALDONE99\b", 600):
+if not wait(r"SERIALDONE99\b", int(os.environ.get("SERIAL_SCRIPT_TIMEOUT", "600"))):
     print("serial: script did not finish", file=sys.stderr)
 print(strip(B[0]))

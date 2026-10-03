@@ -67,6 +67,7 @@ if [ "$MODE" = plain ]; then
   # plain keeps a normal writable root and the stock raspios resize; no overlay,
   # no persist partition.
   chk root-fstype ext4
+  chk firmware-fstype vfat
   [ -z "$(field overlay-upper)" ]  || { warn "plain image carries overlay-upper=$(field overlay-upper)"; fail=1; }
   [ -z "$(field persist-fstype)" ] || { warn "plain image has a persist fs: $(field persist-fstype)"; fail=1; }
   log "plain checks: ext4 root, no overlay, no persist"
@@ -77,6 +78,9 @@ else
   chk overlay-upper "$MODE"
   chk overlay-firstboot active
   chk persist-fstype ext4
+  # FAT moves aside; boot/firmware is the root's own copy that updates layer over.
+  chk firmware-fstype overlay
+  chk bootfs-fstype vfat
   psz="$(field persist-size-mb)"
   if ! { [ -n "$psz" ] && [ "$psz" -gt 1000 ] 2>/dev/null; }; then
     warn "persist-size-mb: got '$psz' want >1000 (first-boot grow failed?)"; fail=1

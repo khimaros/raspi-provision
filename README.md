@@ -21,7 +21,9 @@ make install      # builds with cargo, installs to ~/.local/bin/raspi-provision
 ```
 
 or `cargo install --path .`. it shells out to `libguestfs-tools`, `xz-utils`, and
-`curl` (see [CONTRIBUTING.md](CONTRIBUTING.md) for the full prerequisite list).
+`curl`, plus `apt-get`, `qemu-system-aarch64` (>= 11) and `dtc` to install
+`depends/` at build time (see [CONTRIBUTING.md](CONTRIBUTING.md) for the full
+prerequisite list).
 
 ## configure
 
@@ -82,8 +84,12 @@ NOTE: on a `tmpfs` overlay image, pushed changes live in the volatile upper and
 are lost on reboot; rebuild and reflash for a permanent change, or use
 `raspi-provision overlay-commit`. on `persist` (or a plain image) they stick.
 
-`update` installs the packages listed under `depends/` (one per line, `#`
-comments; organize by category across files, e.g. `depends/base`, `depends/vpn`).
+the packages listed under `depends/` (one per line, `#` comments; organize by
+category across files, e.g. `depends/base`, `depends/vpn`) are installed into the
+image by `image`, so a fresh card runs without internet, and kept current by
+`update`. the build downloads them with the host's `apt-get` (cached under
+`images/.apt-cache`) and installs them in a one-off qemu boot; set
+`BAKE_DEPENDS=0` to skip that and leave them to `update`.
 
 ## shared networks
 
@@ -122,6 +128,13 @@ an overlay image patches the stock initramfs so the card boots the overlay root
 directly. on the first boot the device grows persist online to fill the card -- no
 enablement step and no reboot. the built image is sparse (a few GB regardless of
 card size). tune the minimum persist size with `PERSIST_SIZE_MIB`.
+
+on an overlay image the FAT boot partition is mounted at `/boot/bootfs`;
+`/boot/firmware` is the root's own copy. kernel and firmware upgrades (e.g. from
+`raspi-provision update`) land there like any other change and reach the boot
+partition only once durable: after `overlay-commit` on `tmpfs`, right away on
+`persist`. the next boot copies them over and reboots once more into the new
+kernel. a factory reset puts the image's original kernel back.
 
 to factory reset (restore provisioned state and regenerate identity):
 

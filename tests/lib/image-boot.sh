@@ -61,3 +61,22 @@ EOF
   log "growing work sdcard by $grow (headroom for first-boot grow)"
   truncate -s "+$grow" "$WORK_SD"
 }
+
+# fat_get <dest-dir> <name>...   copy files off the work card's FAT partition, as
+# the firmware would see them on the next power-on. qemu must be stopped.
+fat_get() {
+  local dest="$1"; shift
+  mkdir -p "$dest"
+  { echo "run"; echo "mount-ro /dev/sda1 /"
+    for n in "$@"; do echo "download /$n $dest/$n"; done; } | guestfish --ro -a "$WORK_SD"
+}
+
+# usb_disk <img> <label> <file>...   a fresh vfat usb mass-storage image holding
+# the given files at its root, for attaching to the guest's dwc2 host controller.
+usb_disk() {
+  local img="$1" label="$2"; shift 2
+  rm -f "$img"
+  truncate -s 128M "$img"
+  mkfs.vfat -n "$label" "$img" >/dev/null
+  for f in "$@"; do mcopy -i "$img" "$f" "::$(basename "$f")"; done
+}
