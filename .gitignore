@@ -1,6 +1,6 @@
 /customize.env
 /images/
 /tests/.work/
-/rootfs/root/.ssh/authorized_keys
-/rootfs/home/*/.ssh/authorized_keys
-/bootfs/userconf.txt
+/overlay/root/.ssh/authorized_keys
+/overlay/home/*/.ssh/authorized_keys
+/target/

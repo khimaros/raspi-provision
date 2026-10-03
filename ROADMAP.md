@@ -11,7 +11,7 @@
 [ ] re-evaluate systemd-networkd once it gains native wifi AP + interactive
     network selection: it now covers the wired shared connections (DHCPServer +
     IPMasquerade for usb0/ethernet) but does no wifi link management, so the
-    hotspot and the 'choose a network' flow (make nmtui) keep us on
+    hotspot and the 'choose a network' flow (raspi-provision nmtui) keep us on
     NetworkManager. its declarative model would suit the read-only overlay if
     wifi ever lands (or via NM + iwd as the wifi backend)
 [x] virtualized test environment (qemu raspi4b boot + usb host mode; harness
@@ -93,6 +93,34 @@
     [x] phase C: retired the legacy sudo loop-mount flow (create, test-image,
         test-boot, test-resilience, test-build-image + lib/image.sh/overlay.sh);
         precommit -> test (test-e2e persist + test-usb-host); docs rewritten
+[x] reusable framework: ship raspi-provision as a single invoke-from-anywhere
+    binary (rust) so other projects build images by overlaying their own files on
+    the bundled base, with no vendored makefiles
+    [x] unified asset layout: merge rootfs/ + bootfs/ into one overlay/ tree using
+        runtime paths (overlay/etc/..., overlay/boot/firmware/... -> FAT). build-image
+        takes an ordered OVERLAY_LAYERS (default the framework's own), merges last-
+        wins, mounts the FAT firmware partition at boot/firmware, and tars the whole
+        tree in so each file lands on the right partition. validated: plain + a
+        project overlay (new ext4 file + overridden FAT config.txt) land correctly
+    [x] depends/: replace default-packages with per-category package-list files
+        (depends/base, depends/vpn, ...), one package per line, # comments; the
+        effective list is the union across base + project layers. fed to `update`
+    [x] rust cli (clap): a thin launcher that embeds the framework tree as a build-
+        time tarball (build.rs; tar preserves the exec bit include_dir drops),
+        extracts it per run, reads customize.env (+ process-env override), sets
+        OVERLAY_LAYERS to bundled-base + ./overlay, and execs the bash/guestfish
+        engine -- no logic rewrite. ~130K embedded payload
+    [x] subcommands: init (scaffold customize.env + overlay/ + depends/), download,
+        image, flash, authorize (bake ssh key into ./overlay); maintain over ssh:
+        update (push overlay + install depends + apt full-upgrade), ssh, network,
+        nmtui, screen, factory-reset, overlay-commit, reboot, poweroff
+    [x] reorient the makefile around cargo build/test of the binary; the e2e
+        scenarios build images THROUGH the binary. removed the user-facing make
+        targets (they are binary subcommands now)
+    [x] dropped the now-dead bootfs/userconf.txt (stale credential, never injected)
+    [x] docs: README/CONTRIBUTING/DESIGN/tests rewritten for the `raspi-provision
+        <cmd>` workflow + the downstream-project layout (overlay/ + depends/ +
+        customize.env)
 [ ] virtual gadget-mode test (usb0 RNDIS via out-of-tree dummy_hcd, DKMS)
 [ ] virtual wifi hotspot test (wlan via mac80211_hwsim, generic-kernel lane)
 [x] power-outage resilience (validated via `make test-resilience`)

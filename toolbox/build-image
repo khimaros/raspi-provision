@@ -22,7 +22,13 @@ CUSTOM_PASSWORD="${CUSTOM_PASSWORD:?CUSTOM_PASSWORD must be set}"
 FIRST_USER_UID=1000
 # supplementary groups the first raspios user belongs to (hardware + admin).
 USER_GROUPS="adm dialout cdrom sudo audio video plugdev games users input render netdev gpio i2c spi"
-OVERLAY_SCRIPT="$REPO/rootfs/etc/initramfs-tools/scripts/overlay"
+OVERLAY_SCRIPT="$REPO/overlay/etc/initramfs-tools/scripts/overlay"
+# ordered filesystem layers merged into the image (last wins); default to the
+# framework's own. a downstream project appends its own overlay/ to extend or
+# override the base. the overlay tree uses runtime paths: files under
+# boot/firmware/ go to the FAT firmware partition, everything else to the ext4
+# root. the framework internals above stay framework-owned, not user layers.
+OVERLAY_LAYERS="${OVERLAY_LAYERS:-$REPO/overlay}"
 export PATH="$PATH:/usr/sbin:/sbin"
 
 case "$MODE" in ""|tmpfs|persist) ;; *) echo "overlay-mode must be tmpfs, persist, or empty" >&2; exit 1 ;; esac
@@ -41,13 +47,26 @@ echo "decompressing $SRC -> $OUT"
 xzcat "$SRC" > "$OUT"
 
 # ---- assemble inputs for guestfish ----------------------------------------
-# rootfs overlay as tarballs with explicit ownership (root, except the user's
-# home which is the first user). tar preserves modes and symlinks.
+# merge the ordered overlay layers into one staging tree (last layer wins) so a
+# downstream project can overlay its own files on the framework's base.
+OVERLAY_STAGE="$WORK/overlay"
+mkdir -p "$OVERLAY_STAGE"
+for layer in $OVERLAY_LAYERS; do
+	[ -d "$layer" ] || { echo "overlay layer not found: $layer" >&2; exit 1; }
+	cp -a "$layer/." "$OVERLAY_STAGE/"
+done
+# never inject userconf.txt -- the user is baked offline, so it would re-trigger
+# the stock first-boot user creation.
+rm -f "$OVERLAY_STAGE/boot/firmware/userconf.txt"
+
+# the overlay tarball carries the whole tree (root explicit ownership, except the
+# user's home below); with the FAT firmware partition mounted at boot/firmware,
+# files under it land there. tar preserves modes and symlinks.
 tar --numeric-owner --owner=0 --group=0 --exclude='./home/*' \
-    -C "$REPO/rootfs" -cf "$WORK/rootfs.tar" .
-# the template home dir under rootfs/home (any name) becomes the first user's home.
+    -C "$OVERLAY_STAGE" -cf "$WORK/overlay.tar" .
+# the template home dir under overlay/home (any name) becomes the first user's home.
 have_home=0
-home_src="$(find "$REPO/rootfs/home" -mindepth 1 -maxdepth 1 -type d | head -1)"
+home_src="$(find "$OVERLAY_STAGE/home" -mindepth 1 -maxdepth 1 -type d | head -1)"
 if [ -n "$home_src" ]; then
 	have_home=1
 	tar --numeric-owner --owner="$FIRST_USER_UID" --group="$FIRST_USER_UID" \
@@ -55,7 +74,7 @@ if [ -n "$home_src" ]; then
 fi
 
 # the hostname goes straight to /etc/hostname; the hosts + hotspot files are sed'd
-# from templates on the host (folds the old 'make customize' into the build).
+# from the overlay templates on the host at build time.
 printf '%s\n' "$CUSTOM_HOSTNAME" > "$WORK/hostname"
 cat > "$WORK/customize-files" <<EOF
 #!/bin/bash
@@ -155,7 +174,10 @@ echo "provisioning image with guestfish (mode=${MODE:-plain})"
 	echo "run"
 	[ -n "$part_cmds" ] && echo "$part_cmds"
 	echo "mount /dev/sda2 /"
-	echo "tar-in $WORK/rootfs.tar /"
+	# mount the FAT firmware partition at its runtime path so overlay files
+	# under boot/firmware/ land there when the whole tree is tarred in.
+	echo "mount /dev/sda1 /boot/firmware"
+	echo "tar-in $WORK/overlay.tar /"
 	if [ "$have_home" = 1 ]; then
 		echo "mkdir-p /home/$CUSTOM_USERNAME"
 		echo "chown $FIRST_USER_UID $FIRST_USER_UID /home/$CUSTOM_USERNAME"
@@ -179,10 +201,10 @@ echo "provisioning image with guestfish (mode=${MODE:-plain})"
 	[ "$CUSTOM_USERNAME" != pi ] && echo "rm-rf /home/pi"
 	# the user is baked offline, so finalize the stock first-boot user setup the way
 	# cancel-rename would: drop the ssh 'set up a valid user' banner drop-in.
-	# userconfig.service itself is masked via rootfs; without these the banner shows
+	# userconfig.service itself is masked via the overlay; without these the banner shows
 	# on every login and the wizard hangs on tty8 waiting for a username.
 	echo "rm-f /etc/ssh/sshd_config.d/rename_user.conf"
-	# bake hostname + hotspot identity from CUSTOM_* (folds the old make customize).
+	# bake hostname + hotspot identity from CUSTOM_* at build time.
 	echo "upload $WORK/hostname /etc/hostname"
 	echo "download /etc/hosts $WORK/hosts"
 	echo "download /etc/NetworkManager/system-connections/shared-hotspot.nmconnection $WORK/hotspot"
@@ -205,17 +227,18 @@ echo "provisioning image with guestfish (mode=${MODE:-plain})"
 		# device); grow-persist replaces it, so mask it to keep the boot clean.
 		echo "ln-s /dev/null /etc/systemd/system/systemd-growfs-root.service"
 	fi
-	echo "mount /dev/sda1 /boot"
-	echo "copy-in $REPO/bootfs/config.txt $REPO/bootfs/ssh.txt /boot"
-	echo "download /boot/cmdline.txt $WORK/cmdline"
+	# the firmware partition is already mounted (above) with the overlay's
+	# config.txt/ssh.txt in place; edit the stock cmdline to add the provisioning
+	# tokens and select the overlay shape.
+	echo "download /boot/firmware/cmdline.txt $WORK/cmdline"
 	echo "! $WORK/edit-cmdline $WORK/cmdline"
-	echo "upload $WORK/cmdline /boot/cmdline.txt"
+	echo "upload $WORK/cmdline /boot/firmware/cmdline.txt"
 	# overlay initramfs: patch the stock one on the host, upload it back.
 	if [ -n "$MODE" ]; then
 		for ird in initramfs8 initramfs_2712; do
-			echo "-download /boot/$ird $WORK/$ird"
+			echo "-download /boot/firmware/$ird $WORK/$ird"
 			echo "! [ -f $WORK/$ird ] && $WORK/patch-initramfs $WORK/$ird $WORK/$ird.new || true"
-			echo "-upload $WORK/$ird.new /boot/$ird"
+			echo "-upload $WORK/$ird.new /boot/firmware/$ird"
 		done
 	fi
 	echo "umount-all"

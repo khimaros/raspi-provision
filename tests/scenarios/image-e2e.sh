@@ -2,7 +2,7 @@
 # end-to-end test of an offline-built image: build it, boot the real artifact on
 # qemu root-free (extract its boot bits via guestfish, no sudo), and assert it
 # provisions correctly. modes:
-#   plain   -- writable ext4 root, stock raspios first-boot grow (make image)
+#   plain   -- writable ext4 root, stock raspios first-boot grow
 #   persist -- overlay root, all changes survive; persist grown online to fill card
 #   tmpfs   -- overlay root, ephemeral; identity seeded onto persist
 # usage: image-e2e.sh [plain|persist|tmpfs]   (default: persist)
@@ -16,11 +16,7 @@ case "$MODE" in plain|persist|tmpfs) ;; *) die "usage: image-e2e.sh [plain|persi
 IMG="$REPO/images/$CUSTOM_HOSTNAME.img"
 
 log "building image (mode=$MODE)"
-if [ "$MODE" = plain ]; then
-  make -C "$REPO" image >&2
-else
-  make -C "$REPO" OVERLAY="$MODE" image >&2
-fi
+if [ "$MODE" = plain ]; then build_image; else OVERLAY="$MODE" build_image; fi
 
 image_boot_prepare "$MODE" "$IMG"
 start_qemu

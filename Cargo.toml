@@ -1,0 +1,17 @@
+[package]
+name = "raspi-provision"
+version = "0.1.0"
+edition = "2021"
+description = "build provisioned raspberry pi os images from a base + project overlays"
+
+[[bin]]
+name = "raspi-provision"
+path = "src/main.rs"
+
+# keep dependencies minimal: clap for the subcommand surface, nothing else. the
+# framework tree is embedded via a build-time tarball (build.rs), not a crate.
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+strip = true

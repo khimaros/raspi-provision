@@ -22,11 +22,29 @@ CMDLINE="$WORK/cmdline.txt"
 CONSOLE_LOG="$WORK/console.log"
 QEMU_PIDFILE="$WORK/qemu.pid"
 
-# match the Makefile provisioning defaults so userconf and the built image path
-# line up (the offline build writes images/$CUSTOM_HOSTNAME.img)
-CUSTOM_HOSTNAME="${CUSTOM_HOSTNAME:-elysium}"
-CUSTOM_USERNAME="${CUSTOM_USERNAME:-elysium}"
-CUSTOM_PASSWORD="${CUSTOM_PASSWORD:-elysium9}"
+# the binary builds images/$CUSTOM_HOSTNAME.img; export these so the binary (run
+# from the scenarios) bakes the same identity the assertions check, overriding any
+# repo customize.env.
+export CUSTOM_HOSTNAME="${CUSTOM_HOSTNAME:-elysium}"
+export CUSTOM_USERNAME="${CUSTOM_USERNAME:-elysium}"
+export CUSTOM_PASSWORD="${CUSTOM_PASSWORD:-elysium9}"
+
+# the scenarios build images through the raspi-provision binary; prefer the debug
+# build (what `make build` produces), falling back to the release build.
+if [ -z "${BIN:-}" ]; then
+  for cand in "$REPO/target/debug/raspi-provision" "$REPO/target/release/raspi-provision"; do
+    [ -x "$cand" ] && { BIN="$cand"; break; }
+  done
+  : "${BIN:=$REPO/target/debug/raspi-provision}"
+fi
+need_binary() { [ -x "$BIN" ] || die "binary not built: $BIN (run: make build)"; }
+
+# build images/$CUSTOM_HOSTNAME.img via the binary. run from outside the repo so
+# -C (not the cwd) is what locates the project.
+build_image() {
+  need_binary
+  ( cd "$WORK" && "$BIN" -C "$REPO" image ) >&2
+}
 
 # first boot under TCG is slow and resizes the rootfs; give it room
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-1200}"

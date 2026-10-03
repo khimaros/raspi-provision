@@ -4,7 +4,7 @@
 # on-device while the root is still writable, BEFORE enabling overlay root.
 # idempotent: existing state is left as-is so it is not clobbered on re-run.
 #
-# layout (kept in sync with rootfs/etc/initramfs-tools/scripts/overlay):
+# layout (kept in sync with overlay/etc/initramfs-tools/scripts/overlay):
 #   /persist/state/<path>   bind sources for the ephemeral shape
 #   /persist/factory/state.tar  pristine snapshot restored by a factory reset
 

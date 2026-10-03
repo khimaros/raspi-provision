@@ -1,8 +1,8 @@
 # virtual test environment
 
-builds the real Raspberry Pi OS arm64 image with `make image` and boots the
-artifact on QEMU's `raspi4b` machine, then asserts the result over the serial
-console. fully root-free -- no loop-mount, no sudo. see
+builds the real Raspberry Pi OS arm64 image through the `raspi-provision` binary
+and boots the artifact on QEMU's `raspi4b` machine, then asserts the result over
+the serial console. fully root-free -- no loop-mount, no sudo. see
 [../DESIGN.md](../DESIGN.md) for the architecture and fidelity tradeoffs.
 
 ## run
@@ -11,7 +11,8 @@ console. fully root-free -- no loop-mount, no sudo. see
 make test-e2e             # build + boot, assert provisioning (MODE=plain|persist|tmpfs)
 make test-usb-host        # usb mass-storage enumeration (dwc2 host mode)
 make test-factory-reset   # multi-boot: reset reverts the overlay upper
-make test                 # standard suite: test-e2e (persist) + test-usb-host
+make test-update          # device-free: `update` command order via fake ssh/rsync
+make test                 # standard suite: test-update + test-e2e (persist) + test-usb-host
 make test-clean           # delete tests/.work/
 ```
 
@@ -27,13 +28,16 @@ config comes from `customize.env` / the Makefile defaults (hostname/user/passwor
   enumerated and a sentinel read -- the Pi acting as a usb host.
 - **factory-reset**: on a persist overlay, write a change + set the reset flag,
   reboot, and the initramfs reverts the overlay upper to the read-only base.
+- **update**: `raspi-provision update` pushes the overlay, refreshes apt lists,
+  installs base + project depends, then full-upgrades, in that order.
 
 deferred (see [../ROADMAP.md](../ROADMAP.md)): usb gadget (`usb0` RNDIS) and the
 wifi hotspot, neither of which stock QEMU can emulate.
 
 ## how it works
 
-1. `make image` builds the provisioned image (libguestfs, unprivileged).
+1. the scenario builds the provisioned image via `raspi-provision image`
+   (libguestfs, unprivileged); `make test*` builds the binary first.
 2. `lib/image-boot.sh` copies it to a work card, injects the in-guest report
    service, and extracts `kernel8.img` / the dtb / `cmdline.txt` (+ the patched
    initramfs for overlay images) for qemu.

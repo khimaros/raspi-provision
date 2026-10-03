@@ -1,6 +1,6 @@
 #!/bin/bash
-# root-free boot preparation for a built image -- plain ('make image') or overlay
-# ('make OVERLAY=... image'). works entirely through guestfish (no loop-mount, no
+# root-free boot preparation for a built image -- plain or overlay (built by
+# 'raspi-provision image'). works entirely through guestfish (no loop-mount, no
 # sudo): on a work copy of the image it injects the report service, then extracts
 # the qemu boot artifacts. an overlay image boots via the
 # offline-patched initramfs the firmware would auto-load on hardware; a plain image

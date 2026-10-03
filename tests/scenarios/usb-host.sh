@@ -11,7 +11,7 @@ USB_IMG="$WORK/usb-host.img"
 SENTINEL="RASPI-USB-HOST-OK"
 
 log "building plain image"
-make -C "$REPO" image >&2   # usb host mode is independent of the root overlay shape
+build_image   # usb host mode is independent of the root overlay shape
 image_boot_prepare plain "$REPO/images/$CUSTOM_HOSTNAME.img"
 
 log "building usb mass-storage image with sentinel"

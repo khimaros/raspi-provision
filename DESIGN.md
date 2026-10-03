@@ -3,13 +3,22 @@
 ## provisioning
 
 `raspi-provision` overlays configuration onto an unmodified Raspberry Pi OS
-image rather than building a custom image. the working tree mirrors the target
-filesystem layout (`rootfs/` for the ext4 root, `bootfs/` for the FAT firmware
-partition); `make image` runs `toolbox/build-image`, which lays that tree onto a
-copy of the upstream image offline and unprivileged
-(libguestfs/guestfish, no loop-mount and no sudo) and bakes the per-device bits
-(hostname/user/password/hotspot) from the `CUSTOM_*` vars at build time, leaving
-the working tree untouched.
+image rather than building a custom image. configuration lives in a single
+`overlay/` tree in runtime paths: files under `overlay/boot/firmware/` go to the
+FAT firmware partition, everything else to the ext4 root.
+
+`raspi-provision` is a rust binary (`src/`) that embeds the framework tree
+(`overlay/`, `depends/`, `toolbox/`, `tests/`) at compile time and is a thin
+launcher over the bash/guestfish engine in `toolbox/build-image`. `image` extracts
+the embedded tree, sets `OVERLAY_LAYERS` to the bundled base plus the current
+project's `./overlay` (later layers win), and execs `build-image`, which lays the
+merged tree onto a copy of the upstream image offline and unprivileged
+(libguestfs/guestfish, no loop-mount and no sudo): it mounts the FAT partition at
+`boot/firmware` and tars the whole tree in so each file lands on the right
+partition, and bakes the per-device bits (hostname/user/password/hotspot) from the
+`CUSTOM_*` vars. the working tree is left untouched. a downstream project supplies
+its own `overlay/` + `depends/` + `customize.env` and reuses the same binary, so
+the framework stays a dependency rather than a fork.
 
 connectivity is provided by three NetworkManager `shared` connections, each on
 its own subnet so they can coexist:
@@ -38,7 +47,7 @@ applied unconditionally, independent of the read-only root:
   `/var/swap` writeback file -- a flash writer, and ~150-230MB of RAM under the
   tmpfs overlay root -- and a light appliance with ample RAM does not need swap;
   without it, memory pressure fails fast (oom) instead of thrashing. trixie layers
-  swap in three places, so disabling it takes three overrides in `rootfs/`:
+  swap in three places, so disabling it takes three overrides under `overlay/`:
   `etc/rpi/swap.conf.d/99-no-swap.conf` (`Mechanism=none` -- turns off rpi-swap and
   removes `/var/swap`), `etc/systemd/zram-generator.conf` (no `[zram0]` -- no zram
   swap setup), and `etc/modules-load.d/20-zram-generator.conf` (empty -- stops the
@@ -46,9 +55,9 @@ applied unconditionally, independent of the read-only root:
   older `dphys-swapfile.service -> /dev/null` mask targeted a mechanism trixie no
   longer uses, so it never actually disabled swap; kept as a harmless backstop.)
 - `apt-daily*` and `man-db` periodic timers masked, so the box only writes when
-  `make update` pushes changes. `fstrim` is left enabled (TRIM aids flash health)
+  `raspi-provision update` pushes changes. `fstrim` is left enabled (aids flash health)
 
-mask symlinks ship in `rootfs/etc/systemd/system/` and are laid down by `make image`.
+mask symlinks ship in `overlay/etc/systemd/system/` and are laid down at build time.
 
 ### phase 2: read-only root + persistent partition (implemented)
 
@@ -59,24 +68,23 @@ root mounts read-only under an overlayfs. this follows the same mechanism
   mounts the real root read-only at `/lower`, mounts an upper, and stacks them
   as `overlay` on the real root mount. `overlay` is added to
   `/etc/initramfs-tools/modules`. these two files are static and ship in
-  `rootfs/`.
+  `overlay/`.
 - on the FAT firmware partition, `config.txt` gets `initramfs initrd.img-<KERN>-overlay`
   and `cmdline.txt` is prefixed with `boot=overlay`.
-- the initramfs is kernel-version-bound. the on-device `make overlay` flow
-  builds a fresh one over SSH (`update-initramfs -c -k <KERN>`, renamed to the
-  `-overlay` name). the offline `make image` flow instead patches the stock
-  initramfs in place: it adds only `/scripts/overlay` and reuses the stock
-  kernel modules, so no rebuild is needed and the first boot comes up overlay
-  directly (see provisioning, above).
+- the initramfs is kernel-version-bound. rather than rebuild it on device, the
+  offline build patches the stock initramfs in place: it adds only
+  `/scripts/overlay` and reuses the stock kernel modules, so no rebuild is needed
+  and the first boot comes up overlay directly (see provisioning, above).
 - a conf.d drop-in sets `MODULES=most` (the debian default; stock raspios uses
   `dep`). dep mode resolves the running root device, which fails when the
   kernel mounted root without an initramfs (`/proc/mounts` shows `/dev/root`,
   as under the qemu harness), and most keeps the built initramfs portable.
 
-it is baked into the image by `make OVERLAY=... image` (via `toolbox/build-image`),
-which provisions the stock image unprivileged with libguestfs (`guestfish`) -- no
-loop-mount, no sudo. it carves the persist partition offline, applies `rootfs/`,
-and bakes the user offline (renaming the stock uid-1000 template user). because the
+it is baked into the image by `raspi-provision image` with `OVERLAY` set (via
+`toolbox/build-image`), which provisions the stock image unprivileged with
+libguestfs (`guestfish`) -- no loop-mount, no sudo. it carves the persist
+partition offline, applies the `overlay/` tree, and bakes the user offline
+(renaming the stock uid-1000 template user). because the
 user is pre-baked, it also finalizes the first-boot user setup the way raspios'
 `cancel-rename` would -- masking `userconfig.service` (which otherwise hangs at a
 `whiptail` username prompt on tty8, blocking `multi-user.target`) and dropping the
@@ -103,7 +111,7 @@ a sparse raw image that flashes directly with no manual steps.
   grow an overlay root); a plain (non-`OVERLAY`) image keeps the stock raspios
   resize, which grows root instead.
 
-  the service ships inert in `rootfs/` (no wants symlink) and is enabled only for
+  the service ships inert in `overlay/` (no wants symlink) and is enabled only for
   `OVERLAY` images. it orders only after `regenerate_ssh_host_keys.service` so the
   tmpfs seed captures real host keys, and deliberately depends on nothing in the
   network path, which would otherwise queue it behind the network-online timeout.
@@ -145,7 +153,7 @@ persisted state, restores the factory snapshot, regenerates ssh host keys and
   settable from any machine even when the device is unreachable
 - a GPIO button held at boot (opt-in; not enabled by default, and requires a
   sustained hold so a floating pin cannot trigger a reset loop)
-- `make factory-reset` over ssh
+- `raspi-provision factory-reset` over ssh
 
 ## virtual test environment
 
@@ -197,13 +205,13 @@ both are recorded in ROADMAP.
 
 ### harness structure
 
-the harness is fully root-free -- it builds the real image with `make image` and
-boots the artifact; no loop-mount, no sudo.
+the harness is fully root-free -- it builds the real image through the
+`raspi-provision` binary and boots the artifact; no loop-mount, no sudo.
 
 - the serial console: under qemu raspi4b the kernel console lands on the aux
   mini-uart (`ttyS0`, qemu's second `-serial`) because bluetooth owns the PL011
   (`ttyAMA0`). the harness sets `console=ttyS0,115200` and captures `serial_hd(1)`.
-- `tests/lib/image-boot.sh` -- prepare a built `make [OVERLAY=...] image` for qemu:
+- `tests/lib/image-boot.sh` -- prepare a built image (`raspi-provision image`) for qemu:
   with `guestfish` it injects the report service into a work copy of the image and
   extracts kernel/dtb/cmdline (+ the offline-patched initramfs for overlay images;
   a plain image boots its ext4 root directly)

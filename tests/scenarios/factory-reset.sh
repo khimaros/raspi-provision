@@ -9,7 +9,7 @@ LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
 source "$LIB/common.sh"; source "$LIB/qemu.sh"; source "$LIB/image-boot.sh"
 
 log "building persist image"
-make -C "$REPO" OVERLAY=persist image >&2
+OVERLAY=persist build_image
 image_boot_prepare persist "$REPO/images/$CUSTOM_HOSTNAME.img" 1M
 truncate -s 4294967296 "$WORK_SD"   # 4 GiB (power of 2; small persist for a quick grow)
 
