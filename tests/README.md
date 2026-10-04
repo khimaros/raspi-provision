@@ -14,8 +14,11 @@ make test-factory-reset   # multi-boot: reset reverts the overlay upper
 make test-overlay-commit  # multi-boot: tmpfs commit keeps opaque dirs, deletions, content
 make test-kernel-update   # multi-boot: commit-gated kernel upgrade, backstop, reset
 make test-bake-depends    # depends/ installed into the image at build time
+make test-large-overlay   # an overlay larger than the stock root's free space
+make test-persist-paths   # multi-boot: a directory listed in /etc/persist.d survives
 make test-update          # device-free: `update` command order via fake ssh/rsync
-make test                 # standard suite: test-update + test-e2e (persist) + test-usb-host
+make test-flash           # device-free: `flash` writes gzip and raw images via a fake sudo
+make test                 # standard suite: test-update + test-flash + test-e2e (persist) + test-usb-host
 make test-clean           # delete tests/.work/
 ```
 
@@ -41,6 +44,10 @@ config comes from `customize.env` / the Makefile defaults (hostname/user/passwor
   it from the committed layer). a factory reset restores the base kernel on FAT.
 - **update**: `raspi-provision update` pushes the overlay, refreshes apt lists,
   installs base + project depends, then full-upgrades, in that order.
+- **flash**: `raspi-provision flash` puts the image on the card byte for byte,
+  from `images/<hostname>.img.gz`, a raw `.img` beside it, or a path it is given.
+- **large-overlay**: an overlay bigger than the stock root lands whole, in the
+  gzip image `raspi-provision image` writes when it is given no path.
 
 deferred (see [../ROADMAP.md](../ROADMAP.md)): usb gadget (`usb0` RNDIS) and the
 wifi hotspot, neither of which stock QEMU can emulate.

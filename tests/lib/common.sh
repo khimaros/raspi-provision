@@ -22,12 +22,14 @@ CMDLINE="$WORK/cmdline.txt"
 CONSOLE_LOG="$WORK/console.log"
 QEMU_PIDFILE="$WORK/qemu.pid"
 
-# the binary builds images/$CUSTOM_HOSTNAME.img; export these so the binary (run
-# from the scenarios) bakes the same identity the assertions check, overriding any
-# repo customize.env.
+# export these so the binary (run from the scenarios) bakes the same identity the
+# assertions check, overriding any repo customize.env.
 export CUSTOM_HOSTNAME="${CUSTOM_HOSTNAME:-elysium}"
 export CUSTOM_USERNAME="${CUSTOM_USERNAME:-elysium}"
 export CUSTOM_PASSWORD="${CUSTOM_PASSWORD:-elysium9}"
+# the scenarios boot or inspect what they build, so they ask the binary for a raw
+# image at this path in the project, rather than the gzip it writes by default.
+RAW_IMAGE="images/$CUSTOM_HOSTNAME.img"
 # baking depends adds a long qemu install to every build; only the bake-depends
 # scenario turns it on.
 export BAKE_DEPENDS="${BAKE_DEPENDS:-0}"
@@ -42,11 +44,11 @@ if [ -z "${BIN:-}" ]; then
 fi
 need_binary() { [ -x "$BIN" ] || die "binary not built: $BIN (run: make build)"; }
 
-# build images/$CUSTOM_HOSTNAME.img via the binary. run from outside the repo so
-# -C (not the cwd) is what locates the project.
+# build $RAW_IMAGE via the binary. run from outside the repo so -C (not the cwd)
+# is what locates the project.
 build_image() {
   need_binary
-  ( cd "$WORK" && "$BIN" -C "$REPO" image ) >&2
+  ( cd "$WORK" && "$BIN" -C "$REPO" image "$RAW_IMAGE" ) >&2
 }
 
 # first boot under TCG is slow and resizes the rootfs; give it room

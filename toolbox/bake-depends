@@ -21,6 +21,7 @@ CACHE="${APT_CACHE:-$(cd "$(dirname "$IMG")" && pwd)/.apt-cache}"
 GUEST_DIR=/var/cache/raspi-provision
 BAKE_TIMEOUT="${BAKE_TIMEOUT:-3600}"
 MARKER="raspi-provision-bake: rc="
+INITRAMFS_CONF=/etc/initramfs-tools/update-initramfs.conf
 # headroom on top of the packages' installed size for apt/dpkg working space.
 MARGIN_MIB=256
 
@@ -49,6 +50,13 @@ download /kernel8.img $WORK/boot/kernel8.img
 download /bcm2711-rpi-4-b.dtb $WORK/boot/dtb
 download /cmdline.txt $WORK/boot/cmdline.txt
 EOF
+# the overlay lands on the image only after the bake, but the apt sources and
+# keyrings it adds (e.g. backports) must count now, as they will on the device.
+for layer in ${OVERLAY_LAYERS:-}; do
+	for d in etc/apt usr/share/keyrings; do
+		[ -d "$layer/$d" ] && cp -a "$layer/$d/." "$A/$d/"
+	done
+done
 # the sources name their keyrings by absolute path; point them into the copy.
 sed -i "s|/usr/share/keyrings/|$A/usr/share/keyrings/|g" "$A"/etc/apt/sources.list.d/*.sources 2>/dev/null || true
 # APT_CONFIG is read before any config dir, so the host's own apt config stays out.
@@ -106,6 +114,12 @@ mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev
 mount -t tmpfs tmpfs /run; mount -t tmpfs tmpfs /tmp
 mkdir -p /dev/pts; mount -t devpts devpts /dev/pts
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
+# packages with initramfs hooks (e.g. btrfs-progs) ask for a rebuild, which
+# fails under this boot: mkinitramfs cannot tell the root device. the stock
+# initramfs still boots the image and a kernel update on the device rebuilds
+# it with every hook, so the rebuild is switched off for the bake.
+cp -p $INITRAMFS_CONF $GUEST_DIR/
+sed -i 's/^update_initramfs=.*/update_initramfs=no/' $INITRAMFS_CONF
 rc=0
 while read -r op arg; do
 	if [ "\$op" = --unpack ]; then
@@ -115,6 +129,7 @@ while read -r op arg; do
 	fi
 done < $GUEST_DIR/plan
 [ "\$rc" = 0 ] && { dpkg --force-confold --configure -a || rc=\$?; }
+cp -p $GUEST_DIR/${INITRAMFS_CONF##*/} $INITRAMFS_CONF
 echo "$MARKER\$rc" > /dev/console
 sync; mount -o remount,ro /; sync
 echo o > /proc/sysrq-trigger

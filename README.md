@@ -38,6 +38,7 @@ CUSTOM_PASSWORD=mypassword   # at least 8 bytes so the hotspot works
 OVERLAY=tmpfs                # persist | tmpfs; unset builds a plain image
 MOUNT_DEVICE=/dev/sdb        # the sdcard device that `flash` writes
 ADDRESS=10.55.0.1            # a running device, for the maintain commands
+CMDLINE_EXTRA=psi=1          # kernel parameters to add, space separated, unquoted
 ```
 
 WARNING: if `MOUNT_DEVICE` is wrong you risk destroying important data on that
@@ -55,6 +56,12 @@ raspi-provision authorize        # (optional) bake in your ssh public key
 raspi-provision image            # build a provisioned image
 raspi-provision flash            # write it to the sdcard (MOUNT_DEVICE)
 ```
+
+`image` writes `images/<hostname>.img.gz`, and `flash` decompresses it on the way
+to the card. both take a path instead, relative to the project, to keep several
+images side by side: `raspi-provision image images/kiosk.img.gz`, then
+`raspi-provision flash images/kiosk.img.gz`. a path that does not end in `.gz` is
+a raw image.
 
 set `OVERLAY=persist` (or `tmpfs`) in `customize.env` for the read-only overlay
 root (see [resilience](#resilience)).
@@ -118,6 +125,8 @@ build an overlay image by setting `OVERLAY` in `customize.env`:
 - `OVERLAY=persist`: all changes survive reboots; persist grows to fill the card
 - `OVERLAY=tmpfs`: every reboot is a clean slate; ssh host keys, machine-id,
   NetworkManager connections, and `/home` persist via the `persist` partition.
+  to persist more directories, list them one per line in a file under
+  `/etc/persist.d/` in your project's overlay (for example `/var/lib/myapp`).
   make other changes durable on demand with `raspi-provision overlay-commit` -- it
   commits the current state to `persist` and reboots into it; uncommitted changes
   are discarded on reboot
@@ -126,8 +135,9 @@ build an overlay image by setting `OVERLAY` in `customize.env`:
 (libguestfs, no sudo): it carves the `persist` partition, bakes your user, and for
 an overlay image patches the stock initramfs so the card boots the overlay root
 directly. on the first boot the device grows persist online to fill the card -- no
-enablement step and no reboot. the built image is sparse (a few GB regardless of
-card size). tune the minimum persist size with `PERSIST_SIZE_MIB`.
+enablement step and no reboot. the built image is small regardless of card size:
+gzip-compressed by default, sparse when raw. tune the minimum persist size with
+`PERSIST_SIZE_MIB`.
 
 on an overlay image the FAT boot partition is mounted at `/boot/bootfs`;
 `/boot/firmware` is the root's own copy. kernel and firmware upgrades (e.g. from
@@ -159,8 +169,9 @@ $EDITOR customize.env               # hostname, OVERLAY, etc.
 
 drop files under `overlay/` using runtime paths -- `overlay/etc/my-service.conf`
 lands on the ext4 root, `overlay/boot/firmware/config.txt` on the FAT firmware
-partition. list extra packages under `depends/` (one per line, `#` comments),
-e.g. `depends/myapp`. then:
+partition. the root grows to fit, so large files are fine. list extra packages
+under `depends/` (one per line, `#` comments), e.g. `depends/myapp`; an apt
+source they need goes in `overlay/etc/apt/sources.list.d/`. then:
 
 ```
 raspi-provision image && raspi-provision flash

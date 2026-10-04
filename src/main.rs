@@ -30,6 +30,9 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("IMAGE_RASPIOS_SOURCE", "https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2026-06-19/2026-06-18-raspios-trixie-arm64-lite.img.xz"),
 ];
 
+// an image path with this extension is gzip-compressed; any other is raw.
+const GZIP_EXTENSION: &str = "gz";
+
 const INIT_CUSTOMIZE_ENV: &str = "\
 # raspi-provision project config. uncomment and edit to override the defaults;
 # every key here is exported to the build and to the maintain commands.
@@ -81,9 +84,15 @@ enum Cmd {
     /// download the upstream raspios image into ./images
     Download,
     /// build a provisioned image from customize.env + ./overlay
-    Image,
-    /// write the built image to the card (sudo dd, oflag=direct)
-    Flash,
+    Image {
+        /// where to write it (default ./images/<hostname>.img.gz); gzip-compressed if it ends in .gz
+        path: Option<PathBuf>,
+    },
+    /// write a built image to the card (sudo dd, oflag=direct)
+    Flash {
+        /// the image to write, gzip-compressed if it ends in .gz (default: the one `image` builds)
+        path: Option<PathBuf>,
+    },
     /// bake an ssh public key into ./overlay (default ~/.ssh/id_rsa.pub)
     Authorize { keyfile: Option<PathBuf> },
     /// push ./overlay, install depends, and apt full-upgrade a running device
@@ -130,8 +139,8 @@ fn main() {
     let r = match cli.cmd {
         Cmd::Init { dir } => init(dir.unwrap_or_else(|| PathBuf::from("."))),
         Cmd::Download => download(),
-        Cmd::Image => image(),
-        Cmd::Flash => flash(),
+        Cmd::Image { path } => image(path),
+        Cmd::Flash { path } => flash(path),
         Cmd::Authorize { keyfile } => authorize(keyfile),
         Cmd::Update => update(),
         Cmd::Ssh { root } => run(ssh_cmd(&config(), root, false, &[])),
@@ -174,9 +183,21 @@ fn config() -> Config {
     c
 }
 
-// the provisioned image path follows the hostname, matching the makefile.
-fn image_path(c: &Config) -> String {
-    format!("./images/{}.img", c["CUSTOM_HOSTNAME"])
+// where `image` writes when no path is given: named after the hostname, compressed.
+fn image_path(c: &Config) -> PathBuf {
+    PathBuf::from(format!("./images/{}.img.{GZIP_EXTENSION}", c["CUSTOM_HOSTNAME"]))
+}
+
+// the image `flash` writes when no path is given: the compressed build, or a raw
+// one beside it (from `image images/<hostname>.img`, or an older version).
+fn built_image(c: &Config) -> PathBuf {
+    let gz = image_path(c);
+    let raw = gz.with_extension("");
+    if !gz.exists() && raw.exists() { raw } else { gz }
+}
+
+fn is_gzip(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == GZIP_EXTENSION)
 }
 
 // the ordered layer list for an overlay dir: bundled base then the project's own.
@@ -268,14 +289,14 @@ fn download() -> R {
     run(cmd)
 }
 
-fn image() -> R {
+fn image(path: Option<PathBuf>) -> R {
     let c = config();
     if !Path::new(&c["IMAGE_RASPIOS"]).exists() {
         return Err(format!("upstream image not found: {} (run: raspi-provision download)", c["IMAGE_RASPIOS"]));
     }
     let fw = extract_framework()?;
     let mut cmd = Command::new(fw.join("toolbox/build-image"));
-    cmd.arg(&c["IMAGE_RASPIOS"]).arg(image_path(&c)).arg(&c["OVERLAY"]);
+    cmd.arg(&c["IMAGE_RASPIOS"]).arg(path.unwrap_or_else(|| image_path(&c))).arg(&c["OVERLAY"]);
     for (k, v) in &c {
         cmd.env(k, v);
     }
@@ -284,20 +305,27 @@ fn image() -> R {
     run(cmd)
 }
 
-fn flash() -> R {
+fn flash(path: Option<PathBuf>) -> R {
     let c = config();
-    let img = image_path(&c);
-    if !Path::new(&img).exists() {
-        return Err(format!("built image not found: {img} (run: raspi-provision image)"));
+    let path = path.unwrap_or_else(|| built_image(&c));
+    if !path.exists() {
+        return Err(format!("built image not found: {} (run: raspi-provision image)", path.display()));
     }
-    let dev = &c["MOUNT_DEVICE"];
+    let (img, dev) = (path.display(), &c["MOUNT_DEVICE"]);
+    // a compressed image is decompressed on the way to the card. dd then reads a
+    // pipe, and fullblock keeps its blocks whole, as direct writes need.
+    let read = if is_gzip(&path) {
+        format!("gzip -dc '{img}' | sudo dd iflag=fullblock")
+    } else {
+        format!("sudo dd if='{img}'")
+    };
     // unmount any mounted partitions, then dd straight to the media: oflag=direct
     // bypasses the page cache so a flaky usb reader cannot silently drop writes.
-    let script = format!(
-        "sudo umount {dev}?* 2>/dev/null; sudo dd if='{img}' of='{dev}' bs=4M oflag=direct status=progress && sudo sync"
-    );
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(script);
+    let script =
+        format!("sudo umount {dev}?* 2>/dev/null; {read} of='{dev}' bs=4M oflag=direct status=progress && sudo sync");
+    // pipefail, so an image that does not decompress fails the flash
+    let mut cmd = Command::new("bash");
+    cmd.args(["-o", "pipefail", "-c"]).arg(script);
     run(cmd)
 }
 

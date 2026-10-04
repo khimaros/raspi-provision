@@ -42,6 +42,10 @@ PERSIST_WORK=work
 # paths bind-mounted from the persist partition in the ephemeral shape. keep in
 # sync with toolbox/seed-persist (PERSIST_PATHS).
 PERSIST_BINDS="etc/ssh etc/NetworkManager/system-connections var/lib/NetworkManager home"
+# files in the root listing more directories to bind, one per line, so a
+# downstream project's overlay can add its own. read the same way by
+# toolbox/seed-persist and toolbox/overlay-commit.
+PERSIST_DROPINS=etc/persist.d
 # the root's copy of the FAT partition, and where FAT is mounted here.
 FIRMWARE_DIR=boot/firmware
 BOOTFS=/bootfs
@@ -49,6 +53,9 @@ BOOTFS_MOUNTED=
 FIRMWARE_CHANGED=
 
 find_dev() { blkid -L "$1" 2>/dev/null || findfs "LABEL=$1" 2>/dev/null || true; }
+
+# the directories the assembled root lists in PERSIST_DROPINS, relative to it.
+extra_binds() { cat "${rootmnt}/$PERSIST_DROPINS"/* 2>/dev/null | sed 's/#.*//; s/[[:space:]]*$//; s,^/*,,; /^$/d'; }
 
 # overlayfs marks a directory that replaced a lower one (hiding its entries) with
 # this xattr; plain tar/cp in the initramfs would drop it.
@@ -282,7 +289,7 @@ local_mount_root()
 
 	# re-attach persisted identity over the volatile upper so ssh host keys,
 	# machine-id, NM connections and /home survive reboots without a commit.
-	for p in $PERSIST_BINDS; do
+	for p in $PERSIST_BINDS $(extra_binds); do
 		src="${rootmnt}/persist/$PERSIST_STATE/$p"
 		[ -d "$src" ] || continue
 		mkdir -p "${rootmnt}/$p"

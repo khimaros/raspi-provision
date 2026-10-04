@@ -4,14 +4,16 @@
 # in a user-mode appliance (no loop mount, no root), so modern ext4 features and
 # stock file capabilities are preserved. the user account is baked in offline (no
 # first-boot userconf). with OVERLAY set, carves a persist partition and patches
-# the stock initramfs so the first boot comes up overlay directly.
+# the stock initramfs so the first boot comes up overlay directly. an output
+# named *.gz is gzip-compressed, any other is a sparse raw image.
 #
-# usage: build-image <src.img.xz> <out.img> [tmpfs|persist]
+# usage: build-image <src.img.xz> <out.img[.gz]> [tmpfs|persist]
 
 set -euo pipefail
 
-SRC="${1:?usage: build-image <src.img.xz> <out.img> [tmpfs|persist]}"
-OUT="${2:?usage: build-image <src.img.xz> <out.img> [tmpfs|persist]}"
+USAGE="usage: build-image <src.img.xz> <out.img[.gz]> [tmpfs|persist]"
+SRC="${1:?$USAGE}"
+OUT="${2:?$USAGE}"
 MODE="${3:-}"
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,7 +38,7 @@ export PATH="$PATH:/usr/sbin:/sbin"
 
 case "$MODE" in ""|tmpfs|persist) ;; *) echo "overlay-mode must be tmpfs, persist, or empty" >&2; exit 1 ;; esac
 [ -f "$SRC" ] || { echo "source image not found: $SRC" >&2; exit 1; }
-for t in guestfish tar cpio unmkinitramfs sfdisk openssl; do
+for t in guestfish tar cpio unmkinitramfs sfdisk openssl gzip; do
 	command -v "$t" >/dev/null || { echo "missing required tool: $t" >&2; exit 1; }
 done
 
@@ -57,7 +59,8 @@ xzcat "$SRC" > "$OUT"
 # last partition (bake-depends grows it) and before the overlay files land on top.
 if [ "${BAKE_DEPENDS:-0}" = 1 ] && [ -n "${DEPENDS:-}" ]; then
 	# shellcheck disable=SC2086
-	APT_CACHE="$(cd "$(dirname "$FINAL")" && pwd)/.apt-cache" "$REPO/toolbox/bake-depends" "$OUT" $DEPENDS
+	APT_CACHE="$(cd "$(dirname "$FINAL")" && pwd)/.apt-cache" OVERLAY_LAYERS="$OVERLAY_LAYERS" \
+		"$REPO/toolbox/bake-depends" "$OUT" $DEPENDS
 fi
 
 # ---- assemble inputs for guestfish ----------------------------------------
@@ -72,6 +75,11 @@ done
 # never inject userconf.txt -- the user is baked offline, so it would re-trigger
 # the stock first-boot user creation.
 rm -f "$OVERLAY_STAGE/boot/firmware/userconf.txt"
+# the stock root has little room to spare, so grow it by the overlay's size and a
+# project can carry large files. root is still the last partition here; its
+# filesystem follows in the guestfish session below.
+truncate -s "+$(du -sm --apparent-size "$OVERLAY_STAGE" | cut -f1)M" "$OUT"
+echo ', +' | sfdisk -q --no-reread --force -N 2 "$OUT"
 
 # the overlay tarball carries the whole tree (root explicit ownership, except the
 # user's home below); with the FAT firmware partition mounted at boot/firmware,
@@ -131,13 +139,14 @@ elif [ "\$old" != "\$u" ]; then
 fi
 EOF
 
-# host-side helper: append the provisioning cmdline tokens and, for an overlay
-# image, strip the stock resize trigger and select the upper-layer shape.
+# host-side helper: append the provisioning cmdline tokens and the project's own
+# (CMDLINE_EXTRA, space separated) and, for an overlay image, strip the stock
+# resize trigger and select the upper-layer shape.
 cat > "$WORK/edit-cmdline" <<EOF
 #!/bin/bash
 cmd="\$(tr -d '\r\n' < "\$1")"
 for tok in "cfg80211.ieee80211_regdom=US" "modules-load=dwc2,g_ether" \\
-           "g_ether.dev_addr=12:22:33:44:55:66 g_ether.host_addr=16:22:33:44:55:66"; do
+           "g_ether.dev_addr=12:22:33:44:55:66 g_ether.host_addr=16:22:33:44:55:66" ${CMDLINE_EXTRA:-}; do
 	grep -qF "\${tok%% *}" <<<"\$cmd" || cmd="\$cmd \$tok"
 done
 if [ -n "$MODE" ]; then
@@ -193,6 +202,10 @@ echo "provisioning image with guestfish (mode=${MODE:-plain})"
 {
 	echo "run"
 	[ -n "$part_cmds" ] && echo "$part_cmds"
+	# repair rather than only check: the bake's power-off leaves orphaned inodes
+	# behind, which a preen refuses to touch.
+	echo "e2fsck /dev/sda2 forceall:true"
+	echo "resize2fs /dev/sda2"
 	echo "mount /dev/sda2 /"
 	# mount the FAT firmware partition at its runtime path so overlay files
 	# under boot/firmware/ land there when the whole tree is tarred in.
@@ -277,6 +290,11 @@ guestfish -a "$OUT" < "$WORK/build.gf"
 
 # punch zero runs into holes so the artifact is sparse on disk.
 fallocate -d "$OUT" 2>/dev/null || true
+if [[ "$FINAL" == *.gz ]]; then
+	echo "compressing -> $FINAL"
+	gzip -c "$OUT" > "$OUT.gz"
+	OUT="$OUT.gz"
+fi
 mv "$OUT" "$FINAL"
 echo "built $FINAL${MODE:+ (overlay upper=$MODE)}"
 echo "  apparent: $(du -h --apparent-size "$FINAL" | cut -f1), on disk: $(du -h "$FINAL" | cut -f1)"

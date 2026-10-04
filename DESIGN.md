@@ -26,7 +26,10 @@ arm64 and a root-free build cannot chroot, so the work splits in two:
 
 - the host's `apt-get` resolves and downloads, driven entirely by `APT_CONFIG`
   pointing at a copy of the image's own sources, keyrings and dpkg status (so it
-  fetches only what the image lacks, at arm64). lists and debs persist in
+  fetches only what the image lacks, at arm64). the overlay layers' `etc/apt`
+  and `usr/share/keyrings` are copied over that, so a source a project adds
+  (e.g. backports) resolves at build time as it will on the device. lists and
+  debs persist in
   `images/.apt-cache` and `autoclean` bounds the cache. apt's simulated
   transaction is its exact plan (unpack/configure steps in dependency order):
   it selects this build's debs from the cache and becomes a dpkg script.
@@ -43,6 +46,10 @@ arm64 and a root-free build cannot chroot, so the work splits in two:
   tradeoffs).
 
 `BAKE_DEPENDS=0` skips this; `update` then installs them on the device.
+
+the stock root has little free space, so `build-image` also grows it by the
+size of the merged overlay before applying it, again while root is the last
+partition. a project can then carry large files, such as container images.
 
 connectivity is provided by three NetworkManager `shared` connections, each on
 its own subnet so they can coexist:
@@ -124,7 +131,14 @@ added, and it is repacked as one uncompressed cpio. the kernel auto-loads that
 initramfs on real hardware, so the first boot comes up overlay directly -- no
 on-device initramfs build and no reboot. the cmdline gets `boot=overlay
 overlay-upper=<shape>` (and the stock ` resize` token is stripped). the result is
-a sparse raw image that flashes directly with no manual steps.
+a sparse raw image that flashes directly with no manual steps. `build-image`
+gzips it when the output path ends in `.gz`, which the default
+`images/<hostname>.img.gz` does: a raw image keeps its holes only on filesystems
+and through copies that preserve them. `flash` pipes a `.gz` through `gzip -dc`
+into `dd`, with `iflag=fullblock` so the direct writes stay block sized and
+`pipefail` so a damaged file fails the flash. `image` and `flash` both take the
+path as an argument; the tests build raw images that way, since guestfish and
+qemu read them in place.
 
   on the first boot `overlay-firstboot.service` grows persist online to fill the
   card and (tmpfs shape only) seeds the persisted identity. persist is the last
@@ -150,7 +164,10 @@ are supported, selected at provision time:
 - **ephemeral** (default): upper is tmpfs (reboot = clean slate, power-safe --
   the disk is read-only in normal operation). identity (ssh host keys,
   `machine-id`, NetworkManager connections, `/home`) is bind-mounted from the
-  `persist` partition so it survives reboots automatically. other changes can be
+  `persist` partition so it survives reboots automatically. a downstream
+  project adds directories of its own by listing them in `/etc/persist.d/*` in
+  its overlay; the initramfs, `seed-persist` (which creates them) and
+  `overlay-commit` (which leaves them out) all read those files. other changes can be
   made durable on demand with `toolbox/overlay-commit`: it stages the live tmpfs
   upper onto `persist` (`rsync -aHAX`, keeping whiteouts and opaque-dir xattrs)
   and reboots; the initramfs folds the staged delta into a committed layer

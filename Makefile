@@ -61,13 +61,28 @@ test-bake-depends: build
 	tests/scenarios/bake-depends.sh
 .PHONY: test-bake-depends
 
+# build a project whose overlay outgrows the stock root, assert it landed whole.
+test-large-overlay: build
+	tests/scenarios/large-overlay.sh
+.PHONY: test-large-overlay
+
+# multi-boot: a directory the project lists in /etc/persist.d survives a power cut.
+test-persist-paths: build
+	tests/scenarios/persist-paths.sh
+.PHONY: test-persist-paths
+
 # device-free: fake ssh/rsync record the maintain `update` command sequence.
 test-update: build
 	python3 tests/scenarios/maintain-update.py
 .PHONY: test-update
 
-# standard pre-commit suite: maintain update + overlay provisioning (persist) + usb host mode.
-test: test-update test-e2e test-usb-host
+# device-free: a fake sudo lets dd write gzip and raw images to a file standing in for the card.
+test-flash: build
+	python3 tests/scenarios/flash-image.py
+.PHONY: test-flash
+
+# standard pre-commit suite: maintain update + flash + overlay provisioning (persist) + usb host mode.
+test: test-update test-flash test-e2e test-usb-host
 .PHONY: test
 
 test-clean:

@@ -23,6 +23,9 @@ FLAG="$PERSIST/.commit-pending"
 # the live upper predates the bind and would only be hidden by it. keep in sync
 # with toolbox/seed-persist (PERSIST_PATHS).
 STATE_PATHS=(etc/ssh etc/NetworkManager/system-connections var/lib/NetworkManager home etc/machine-id)
+PERSIST_DROPINS=/etc/persist.d
+mapfile -t EXTRA_PATHS < <(cat "$PERSIST_DROPINS"/* 2>/dev/null | sed 's/#.*//; s/[[:space:]]*$//; s,^/*,,; /^$/d')
+STATE_PATHS+=("${EXTRA_PATHS[@]}")
 
 [ "$(id -u)" -eq 0 ] || { echo "overlay-commit: must run as root (use sudo)"; exit 1; }
 

@@ -46,12 +46,20 @@ scenarios read `CUSTOM_*` from the environment.
 - `make test-kernel-update` -- tmpfs: install a newer kernel deb, commit, assert
   FAT follows only after the commit, the new kernel boots, a reset restores the base
 - `make test-bake-depends`  -- build a throwaway project (via `-C`) whose
-  `depends/` adds a package, boot offline, assert it and the base packages are in.
+  `depends/` adds a package, and another from an apt source its overlay adds, boot
+  offline, assert they and the base packages are in.
   the other scenarios build with `BAKE_DEPENDS=0` to stay fast
+- `make test-large-overlay` -- build a project whose overlay outgrows the stock
+  root and assert, with guestfish and no boot, that it landed whole. the one
+  scenario that builds the default gzip image; the others name a raw one
+- `make test-persist-paths` -- tmpfs: build a project whose overlay lists a
+  directory in `/etc/persist.d`, cut the power, assert it alone kept its file
 - `make test-update`        -- device-free: fake `ssh`/`rsync` record the `update`
   command sequence and assert apt lists refresh before the depends install
+- `make test-flash`         -- device-free: a fake `sudo` runs `dd` against a file
+  standing in for the card, and assert it holds the image, gzip or raw, named or not
 - `make test`               -- the standard pre-commit suite: `test-update` +
-  `test-e2e` (persist) + `test-usb-host`
+  `test-flash` + `test-e2e` (persist) + `test-usb-host`
 - `make test-clean`         -- remove work artifacts in `tests/.work/`
 
 before committing, run `make precommit` (runs `make test`). prefer end-to-end
