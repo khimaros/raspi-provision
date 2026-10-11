@@ -18,7 +18,9 @@ make test-large-overlay   # an overlay larger than the stock root's free space
 make test-persist-paths   # multi-boot: a directory listed in /etc/persist.d survives
 make test-update          # device-free: `update` command order via fake ssh/rsync
 make test-flash           # device-free: `flash` writes gzip and raw images via a fake sudo
-make test                 # standard suite: test-update + test-flash + test-e2e (persist) + test-usb-host
+make test-ota             # device-free: `ota` hands a device the writer, then the image, via a fake ssh
+make test-ota-write       # multi-boot: the writer replaces the card a booted system runs from
+make test                 # standard suite: test-update + test-flash + test-ota + test-e2e (persist) + test-usb-host
 make test-clean           # delete tests/.work/
 ```
 
@@ -46,6 +48,11 @@ config comes from `customize.env` / the Makefile defaults (hostname/user/passwor
   installs base + project depends, then full-upgrades, in that order.
 - **flash**: `raspi-provision flash` puts the image on the card byte for byte,
   from `images/<hostname>.img.gz`, a raw `.img` beside it, or a path it is given.
+- **ota**: `raspi-provision ota` copies `toolbox/ota-write` to the device, then
+  pipes it the image as gzip, compressing a raw one on the way.
+- **ota-write**: on tmpfs, the writer is given a second image, one file apart,
+  from a usb disk. it overwrites the card under the running system, and the
+  next boot is the second image.
 - **large-overlay**: an overlay bigger than the stock root lands whole, in the
   gzip image `raspi-provision image` writes when it is given no path.
 

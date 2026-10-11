@@ -14,7 +14,7 @@ framework itself.
   root. a downstream project layers its own `overlay/` on top (last-writer-wins)
 - `depends/` -- base package lists installed by `update` (one per line, # comments)
 - `toolbox/` -- the offline build engine (`build-image`, `bake-depends`) and on-device helpers
-  (`grow-persist`, `seed-persist`, `overlay-commit`)
+  (`grow-persist`, `seed-persist`, `overlay-commit`, `ota-write`)
 - `tests/` -- the root-free qemu harness (see [tests/README.md](tests/README.md))
 
 ## build
@@ -58,9 +58,14 @@ scenarios read `CUSTOM_*` from the environment.
   command sequence and assert apt lists refresh before the depends install
 - `make test-flash`         -- device-free: a fake `sudo` runs `dd` against a file
   standing in for the card, and assert it holds the image, gzip or raw, named or not
+- `make test-ota`           -- device-free: a fake `ssh` keeps what `ota` sends, and
+  assert the device is handed the writer, then the image as gzip
+- `make test-ota-write`     -- tmpfs: hand `toolbox/ota-write` a second image on a
+  booted system, power-cycle, assert the card boots that image
 - `make test`               -- the standard pre-commit suite: `test-update` +
-  `test-flash` + `test-e2e` (persist) + `test-usb-host`
+  `test-flash` + `test-ota` + `test-e2e` (persist) + `test-usb-host`
 - `make test-clean`         -- remove work artifacts in `tests/.work/`
+- `make clean`              -- that, and cargo's `target/`. `images/` is left
 
 before committing, run `make precommit` (runs `make test`). prefer end-to-end
 integration tests over unit tests.

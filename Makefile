@@ -17,6 +17,12 @@ install: build-release
 	install -Dm755 $(BIN) $(HOME)/.local/bin/raspi-provision
 .PHONY: install
 
+# remove what building and testing leave behind. images/ stays: it holds the
+# upstream download, and images built for a device.
+clean: test-clean
+	$(CARGO) clean
+.PHONY: clean
+
 null:
 	@echo "see README for instructions; end users run 'raspi-provision <cmd>'"
 .PHONY: null
@@ -81,8 +87,18 @@ test-flash: build
 	python3 tests/scenarios/flash-image.py
 .PHONY: test-flash
 
-# standard pre-commit suite: maintain update + flash + overlay provisioning (persist) + usb host mode.
-test: test-update test-flash test-e2e test-usb-host
+# device-free: a fake ssh records what `ota` hands a running device.
+test-ota: build
+	python3 tests/scenarios/ota-image.py
+.PHONY: test-ota
+
+# multi-boot: the writer `ota` runs on the device replaces the card it booted from.
+test-ota-write: build
+	tests/scenarios/ota-write.sh
+.PHONY: test-ota-write
+
+# standard pre-commit suite: maintain update + flash + ota + overlay provisioning (persist) + usb host mode.
+test: test-update test-flash test-ota test-e2e test-usb-host
 .PHONY: test
 
 test-clean:

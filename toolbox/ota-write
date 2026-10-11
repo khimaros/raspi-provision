@@ -1,0 +1,77 @@
+#!/bin/bash
+# replace the image on the card this device booted from with the gzip image on
+# stdin, then restart into it. `raspi-provision ota` copies this to the device's
+# /run and pipes it the image over ssh, so a device flashed before this existed
+# takes it too. like `flash`, it replaces the whole card: persist goes with it.
+#
+# the card is overwritten under a running system, so that system has to go on
+# without it. everything on the card is made read-only first, so nothing the old
+# system still holds is written over the new image. every file a running program
+# has mapped is read once more, since a page the kernel fetches later would come
+# from the new image. that is a habit of the page cache and no promise: with
+# memory to spare nothing is dropped, and the pipe below needs little.
+#
+# a stream that ends early or does not decompress leaves the card half written
+# and this system still up, in memory, to be sent the image again. once it loses
+# power in that state the card needs a reader.
+#
+# run as root. usage: ota-write [card-device] < image.gz  (default: by 'bootfs' label)
+
+set -euo pipefail
+
+BOOT_LABEL=bootfs
+# what this script still starts after the first block is written
+TOOLS=(gzip dd sleep)
+# seconds for the kernel to make the card's filesystems read-only
+REMOUNT_TIMEOUT=30
+# seconds between reporting success and the restart, for ssh to pass it on
+RESTART_DELAY=2
+
+die() { echo "ota: $*" >&2; exit 1; }
+
+# hold every file a running program has mapped, and the tools, in the page cache
+keep_in_memory() {
+	{ awk '$6 ~ "^/" { print $6 }' /proc/[0-9]*/maps 2>/dev/null; command -v "${TOOLS[@]}"; } \
+		| sort -u | xargs -r -d '\n' cat 2>/dev/null >/dev/null || true
+}
+
+# true while a filesystem on a block device still takes writes
+writable() {
+	awk '$1 ~ "^/dev/" && $4 ~ /^rw(,|$)/ { found = 1 } END { exit !found }' /proc/mounts
+}
+
+# the kernel's emergency remount: unlike `mount -o remount,ro` it does not
+# refuse a filesystem with files open for writing, as the overlay upper has
+make_read_only() {
+	sync
+	echo u > /proc/sysrq-trigger
+	for ((i = 0; i < REMOUNT_TIMEOUT; i++)); do
+		writable || return 0
+		sleep 1
+	done
+	return 1
+}
+
+[ "$(id -u)" -eq 0 ] || die "must run as root"
+[ -t 0 ] && die "no image on stdin"
+card="${1:-}"
+if [ -z "$card" ]; then
+	boot="$(blkid -L "$BOOT_LABEL" 2>/dev/null)" || die "no '$BOOT_LABEL' partition to find the card by"
+	card="/dev/$(lsblk -no pkname "$boot")"
+fi
+[ -b "$card" ] || die "$card is not a block device"
+
+keep_in_memory
+make_read_only || die "filesystems still writable after ${REMOUNT_TIMEOUT}s; nothing written. restart to go on as before"
+
+echo "ota: writing $card"
+# fullblock keeps dd's blocks whole off the pipe, as direct writes need, and
+# direct keeps the image out of the page cache, where it would crowd out what
+# was read into it above. fsync, since no `sync` can be started afterwards
+if ! gzip -dc | dd of="$card" bs=4M iflag=fullblock oflag=direct conv=fsync status=progress; then
+	die "FAILED part way: the card holds neither image whole. this system still runs from memory, so send the image again before it loses power"
+fi
+
+echo "ota: written, restarting"
+# the kernel's own restart: `reboot` would be read from the card just replaced
+( trap '' HUP; sleep "$RESTART_DELAY"; echo b > /proc/sysrq-trigger ) </dev/null >/dev/null 2>&1 &

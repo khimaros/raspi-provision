@@ -33,6 +33,10 @@ const DEFAULTS: &[(&str, &str)] = &[
 // an image path with this extension is gzip-compressed; any other is raw.
 const GZIP_EXTENSION: &str = "gz";
 
+// where `ota` leaves the writer on the device: in ram, like all it runs from
+// once the card is being replaced.
+const OTA_WRITER: &str = "/run/raspi-provision-ota-write";
+
 const INIT_CUSTOMIZE_ENV: &str = "\
 # raspi-provision project config. uncomment and edit to override the defaults;
 # every key here is exported to the build and to the maintain commands.
@@ -97,6 +101,11 @@ enum Cmd {
     Authorize { keyfile: Option<PathBuf> },
     /// push ./overlay, install depends, and apt full-upgrade a running device
     Update,
+    /// write a built image to the card of a running device over ssh, and restart it
+    Ota {
+        /// the image to write, gzip-compressed if it ends in .gz (default: the one `image` builds)
+        path: Option<PathBuf>,
+    },
     /// open an interactive ssh session to the device
     Ssh {
         /// connect as root instead of the configured user
@@ -143,6 +152,7 @@ fn main() {
         Cmd::Flash { path } => flash(path),
         Cmd::Authorize { keyfile } => authorize(keyfile),
         Cmd::Update => update(),
+        Cmd::Ota { path } => ota(path),
         Cmd::Ssh { root } => run(ssh_cmd(&config(), root, false, &[])),
         Cmd::Network { connection } => network(connection),
         Cmd::Nmtui => run(ssh_cmd(&config(), true, true, &["nmtui"])),
@@ -305,12 +315,19 @@ fn image(path: Option<PathBuf>) -> R {
     run(cmd)
 }
 
+// the image `flash` and `ota` write: the one named, or the one `image` built.
+fn image_to_write(c: &Config, path: Option<PathBuf>) -> Result<PathBuf, String> {
+    let path = path.unwrap_or_else(|| built_image(c));
+    if path.exists() {
+        Ok(path)
+    } else {
+        Err(format!("built image not found: {} (run: raspi-provision image)", path.display()))
+    }
+}
+
 fn flash(path: Option<PathBuf>) -> R {
     let c = config();
-    let path = path.unwrap_or_else(|| built_image(&c));
-    if !path.exists() {
-        return Err(format!("built image not found: {} (run: raspi-provision image)", path.display()));
-    }
+    let path = image_to_write(&c, path)?;
     let (img, dev) = (path.display(), &c["MOUNT_DEVICE"]);
     // a compressed image is decompressed on the way to the card. dd then reads a
     // pipe, and fullblock keeps its blocks whole, as direct writes need.
@@ -365,6 +382,34 @@ fn update() -> R {
         run(apt)?;
     }
     run(ssh_cmd(&c, true, false, &["apt-get", "-y", "full-upgrade", "--autoremove", "--purge"]))
+}
+
+// replace the card of a running device with a built image. the device runs
+// toolbox/ota-write, handed over first so that a device flashed before `ota`
+// existed takes it too. the image always travels as gzip: the writer then
+// fails on a stream that was cut short, where a raw one would pass as whole.
+fn ota(path: Option<PathBuf>) -> R {
+    let c = config();
+    let path = image_to_write(&c, path)?;
+    let fw = extract_framework()?;
+    let writer = fs::File::open(fw.join("toolbox/ota-write")).map_err(|e| format!("ota-write: {e}"))?;
+    let mut push = ssh_cmd(&c, true, false, &["cat", ">", OTA_WRITER]);
+    push.stdin(writer);
+    run(push)?;
+    let mut write = ssh_cmd(&c, true, false, &["bash", OTA_WRITER]);
+    let image = fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if is_gzip(&path) {
+        write.stdin(image);
+        return run(write);
+    }
+    let mut gzip = Command::new("gzip");
+    let mut gzip = gzip.arg("-1c").stdin(image).stdout(Stdio::piped()).spawn().map_err(|e| format!("gzip: {e}"))?;
+    write.stdin(gzip.stdout.take().unwrap());
+    let written = run(write);
+    match gzip.wait() {
+        Ok(s) if s.success() => written,
+        _ => Err(format!("gzip failed on {}", path.display())),
+    }
 }
 
 fn network(connection: String) -> R {

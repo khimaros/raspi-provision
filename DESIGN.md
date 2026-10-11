@@ -140,6 +140,33 @@ into `dd`, with `iflag=fullblock` so the direct writes stay block sized and
 path as an argument; the tests build raw images that way, since guestfish and
 qemu read them in place.
 
+`ota` writes the same image to the card of a running device. the device has one
+card and nowhere else to hold an image, which can be larger than its memory, so
+the image is streamed over ssh straight onto the card the system booted from.
+`toolbox/ota-write` does it, copied to the device's `/run` on every run rather
+than baked into the image, so devices flashed before it existed take it too. it
+keeps the running system alive without its card in three steps:
+
+- it reads every file a running program has mapped, and the few tools it still
+  has to start, so they are in the page cache. a page fetched from the card
+  later would come out of the new image. the page cache makes no promise to
+  keep them; with memory to spare it does, and the write is done with
+  `oflag=direct` so the image itself takes none.
+- it makes every filesystem on a block device read-only with the kernel's
+  emergency remount (sysrq `u`), and waits for `/proc/mounts` to show it.
+  `mount -o remount,ro` refuses a filesystem with files open for writing, which
+  the overlay upper always has. without this the old system's journal would
+  land in the new image.
+- it restarts through sysrq `b`, since `reboot` would be read from the card
+  just replaced.
+
+the image always travels as gzip, compressed on the way if it was built raw: a
+stream cut short then fails to decompress on the device, where a raw one would
+pass for a whole image. on failure the writer does not restart, so the device
+stays up for another attempt. what this cannot give is a way back from an image
+that does not start; that would take a second copy of the system on the card to
+fall back to.
+
   on the first boot `overlay-firstboot.service` grows persist online to fill the
   card and (tmpfs shape only) seeds the persisted identity. persist is the last
   partition and the live overlay upper, so it is both mounted and busy: parted
@@ -301,7 +328,9 @@ the harness is fully root-free -- it builds the real image through the
   MODE=plain|persist|tmpfs`: build + boot, assert provisioning -- writable ext4
   root for plain, or overlay root + baked user + online persist grow for overlay),
   `usb-host.sh` (usb mass-storage enumeration), `factory-reset.sh` (multi-boot: the
-  reset reverts the overlay upper to the read-only base)
+  reset reverts the overlay upper to the read-only base), `ota-write.sh`
+  (multi-boot: the writer replaces the card a booted system runs from, with the
+  image and the writer on a usb disk in place of ssh)
 
 work artifacts (the work copy of the card, extracted kernel/dtb/initramfs, console
 logs) live in `tests/.work/` and are gitignored (`make test-clean` removes them).

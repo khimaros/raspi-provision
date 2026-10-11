@@ -82,7 +82,17 @@ raspi-provision nmtui            # choose an internet connection
 raspi-provision update           # push overlay + packages to a running device
 raspi-provision network hotspot  # bring up the shared WiFi hotspot
 raspi-provision ssh              # shell in
+raspi-provision ota              # DESTRUCTIVE: write a built image to its card, and restart
 ```
+
+`ota` is `flash` for a device that is up: it sends the image over ssh, the
+device writes it to the card it booted from and restarts into it, and the card
+never leaves the device. it takes the same optional path as `flash`, and like a
+flash it replaces everything on the card, `persist` included. the device goes on
+running from memory while its card is written. a transfer that fails leaves the
+card half written and the device still up, to be sent the image again; one that
+loses power in that state needs its card in a reader, as does one whose new
+image does not start.
 
 NOTE: connecting to a WiFi network deactivates the shared WiFi hotspot and (if
 autoconnect is enabled) may keep it from starting on boot.
