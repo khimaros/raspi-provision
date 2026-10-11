@@ -3,48 +3,74 @@
 # harness can assert the offline-built image came up correctly -- works for a plain
 # image (writable ext4 root) and an overlay image (overlay root + grown persist).
 # injected and enabled only on the virtual test image by tests/lib/image-boot.sh.
-exec >/dev/console 2>&1
+
+# how long the boot may go on settling before the report is made regardless. the
+# harness's own BOOT_TIMEOUT still bounds the whole wait.
+SETTLE_TIMEOUT=600
+
+# the report is made once the boot is over, and written in one go. made while
+# units were still starting, it raced them: on a busy host the login prompt landed
+# in the middle of it, joining a line the harness then could not find, and the
+# list of failed units depended on when it was read.
+timeout "$SETTLE_TIMEOUT" systemctl is-system-running --wait --quiet 2>/dev/null
 # overlay images: wait for the first-boot grow to finish so persist size is real.
 # on a plain image overlay-firstboot does not exist, so this returns immediately.
 for i in $(seq 1 18); do [ "$(systemctl is-active overlay-firstboot 2>/dev/null)" = activating ] || break; sleep 5; done
-sleep 3
 
-# the offline build renames the stock uid-1000 template user; derive it from uid.
-u="$(getent passwd 1000)"
-name="$(echo "$u" | cut -d: -f1)"
+# each failed unit with why systemd says it failed, as name=result
+failed_units() {
+	for unit in $(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}'); do
+		echo "$unit=$(systemctl show --property Result --value "$unit" 2>/dev/null)"
+	done | paste -sd, -
+}
 
-echo "===TEST-REPORT-BEGIN==="
-echo "hostname: $(hostname)"
-echo "root-fstype: $(findmnt -no FSTYPE /)"
-echo "overlay-upper: $(sed -n 's/.*overlay-upper=\([^ ]*\).*/\1/p' /proc/cmdline)"
-echo "overlay-firstboot: $(systemctl is-active overlay-firstboot 2>/dev/null)"
-echo "persist-fstype: $(findmnt -no FSTYPE /persist 2>/dev/null)"
-echo "firmware-fstype: $(findmnt -no FSTYPE /boot/firmware 2>/dev/null)"
-echo "bootfs-fstype: $(findmnt -no FSTYPE /boot/bootfs 2>/dev/null)"
-echo "persist-size-mb: $(df -m --output=size /persist 2>/dev/null | tail -1 | tr -d ' ')"
-echo "user-name: $name"
-echo "user-uid: $(id -u "$name" 2>/dev/null)"
-echo "user-shell: $(echo "$u" | cut -d: -f7)"
-echo "user-sudo: $(id -nG "$name" 2>/dev/null | grep -qw sudo && echo yes || echo no)"
-echo "sshd: $(systemctl is-active ssh)"
-echo "networkd: $(systemctl is-active systemd-networkd 2>/dev/null)"
-echo "userconfig: $(systemctl is-active userconfig 2>/dev/null)"
-echo "ssh-banner: $(sshd -T 2>/dev/null | awk '/^banner/{print $2}')"
-echo "nm-conns: $(nmcli -t -f NAME connection show 2>/dev/null | paste -sd, -)"
 # usb host-mode probe: read a sentinel off an attached usb mass-storage device (the
 # usb-host scenario attaches one). 'none' when no such device is present.
-usb=""
-for dev in /dev/sd? /dev/sd?1; do
-	[ -b "$dev" ] || continue
-	if mount -o ro "$dev" /mnt 2>/dev/null; then
-		[ -f /mnt/SENTINEL.TXT ] && usb="$(tr -d '[:space:]' < /mnt/SENTINEL.TXT)"
-		umount /mnt 2>/dev/null || true
-		[ -n "$usb" ] && break
-	fi
-done
-echo "usb-content: ${usb:-none}"
-sw="$(swapon --show=NAME --noheadings 2>/dev/null | paste -sd, -)"
-echo "swap-active: ${sw:-none}"
-echo "zram-device: $(test -e /dev/zram0 && echo present || echo none)"
-echo "failed-units: $(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | paste -sd, -)"
-echo "===TEST-REPORT-END==="
+usb_content() {
+	local usb=""
+	for dev in /dev/sd? /dev/sd?1; do
+		[ -b "$dev" ] || continue
+		if mount -o ro "$dev" /mnt 2>/dev/null; then
+			[ -f /mnt/SENTINEL.TXT ] && usb="$(tr -d '[:space:]' < /mnt/SENTINEL.TXT)"
+			umount /mnt 2>/dev/null || true
+			[ -n "$usb" ] && break
+		fi
+	done
+	echo "${usb:-none}"
+}
+
+report() {
+	# the offline build renames the stock uid-1000 template user; derive it from uid.
+	u="$(getent passwd 1000)"
+	name="$(echo "$u" | cut -d: -f1)"
+	sw="$(swapon --show=NAME --noheadings 2>/dev/null | paste -sd, -)"
+
+	echo "===TEST-REPORT-BEGIN==="
+	echo "hostname: $(hostname)"
+	echo "root-fstype: $(findmnt -no FSTYPE /)"
+	echo "overlay-upper: $(sed -n 's/.*overlay-upper=\([^ ]*\).*/\1/p' /proc/cmdline)"
+	echo "overlay-firstboot: $(systemctl is-active overlay-firstboot 2>/dev/null)"
+	echo "persist-fstype: $(findmnt -no FSTYPE /persist 2>/dev/null)"
+	echo "firmware-fstype: $(findmnt -no FSTYPE /boot/firmware 2>/dev/null)"
+	echo "bootfs-fstype: $(findmnt -no FSTYPE /boot/bootfs 2>/dev/null)"
+	echo "persist-size-mb: $(df -m --output=size /persist 2>/dev/null | tail -1 | tr -d ' ')"
+	echo "user-name: $name"
+	echo "user-uid: $(id -u "$name" 2>/dev/null)"
+	echo "user-shell: $(echo "$u" | cut -d: -f7)"
+	echo "user-sudo: $(id -nG "$name" 2>/dev/null | grep -qw sudo && echo yes || echo no)"
+	echo "sshd: $(systemctl is-active ssh)"
+	echo "networkd: $(systemctl is-active systemd-networkd 2>/dev/null)"
+	echo "userconfig: $(systemctl is-active userconfig 2>/dev/null)"
+	echo "ssh-banner: $(sshd -T 2>/dev/null | awk '/^banner/{print $2}')"
+	echo "nm-conns: $(nmcli -t -f NAME connection show 2>/dev/null | paste -sd, -)"
+	echo "usb-content: $(usb_content)"
+	echo "swap-active: ${sw:-none}"
+	echo "zram-device: $(test -e /dev/zram0 && echo present || echo none)"
+	echo "failed-units: $(failed_units)"
+	echo "===TEST-REPORT-END==="
+}
+
+# one write, which the tty does not interleave with another writer's, and from a
+# line of its own whatever the console was in the middle of
+lines="$(report 2>&1)"
+printf '\n%s\n' "$lines" > /dev/console

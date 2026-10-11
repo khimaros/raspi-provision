@@ -6,9 +6,10 @@ Description=virtual test harness image report
 After=overlay-firstboot.service NetworkManager.service
 
 [Service]
-Type=oneshot
+# not a oneshot: the report waits for the boot to be over, and a oneshot still
+# starting is a boot that is not
+Type=exec
 ExecStart=/usr/local/sbin/image-report
-RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target

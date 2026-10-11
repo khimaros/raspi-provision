@@ -24,6 +24,7 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("OVERLAY", ""),
     ("MOUNT_DEVICE", "/dev/sda"),
     ("ADDRESS", "10.55.0.1"),
+    ("OTA_WAIT_SECONDS", "60"),
     ("PERSIST_SIZE_MIB", "128"),
     ("BAKE_DEPENDS", "1"),
     ("IMAGE_RASPIOS", "./images/raspios-lite.img.xz"),
@@ -36,6 +37,8 @@ const GZIP_EXTENSION: &str = "gz";
 // where `ota` leaves the writer on the device: in ram, like all it runs from
 // once the card is being replaced.
 const OTA_WRITER: &str = "/run/raspi-provision-ota-write";
+// seconds one attempt to reach the device may take, and between attempts
+const OTA_PROBE_SECONDS: u64 = 3;
 
 const INIT_CUSTOMIZE_ENV: &str = "\
 # raspi-provision project config. uncomment and edit to override the defaults;
@@ -388,9 +391,31 @@ fn update() -> R {
 // toolbox/ota-write, handed over first so that a device flashed before `ota`
 // existed takes it too. the image always travels as gzip: the writer then
 // fails on a stream that was cut short, where a raw one would pass as whole.
+// wait until the device answers ssh, for OTA_WAIT_SECONDS at most. a device
+// asked a moment ago to bring a network up, as one that has just given its
+// usb port back to usb networking was, takes seconds to appear, and the host
+// seconds more to get an address from it.
+fn wait_for_device(c: &Config) -> R {
+    let limit: u64 = c["OTA_WAIT_SECONDS"].parse().map_err(|_| "OTA_WAIT_SECONDS is not a number of seconds")?;
+    let start = std::time::Instant::now();
+    loop {
+        let mut probe = Command::new("ssh");
+        probe.arg("-o").arg(format!("ConnectTimeout={OTA_PROBE_SECONDS}"));
+        probe.arg(format!("root@{}", c["ADDRESS"])).arg("true").stderr(Stdio::null());
+        if run(probe).is_ok() {
+            return Ok(());
+        }
+        if start.elapsed().as_secs() >= limit {
+            return Err(format!("no answer from {} over ssh in {limit}s", c["ADDRESS"]));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(OTA_PROBE_SECONDS));
+    }
+}
+
 fn ota(path: Option<PathBuf>) -> R {
     let c = config();
     let path = image_to_write(&c, path)?;
+    wait_for_device(&c)?;
     let fw = extract_framework()?;
     let writer = fs::File::open(fw.join("toolbox/ota-write")).map_err(|e| format!("ota-write: {e}"))?;
     let mut push = ssh_cmd(&c, true, false, &["cat", ">", OTA_WRITER]);

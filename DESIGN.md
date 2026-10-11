@@ -167,6 +167,13 @@ stays up for another attempt. what this cannot give is a way back from an image
 that does not start; that would take a second copy of the system on the card to
 fall back to.
 
+before any of it `ota` asks the device for `true` over ssh until it answers or
+`OTA_WAIT_SECONDS` have passed. the base image gives the usb port to rndis, and a
+project whose own service takes that port has to hand it back first; the device
+then needs seconds to bring `shared-rndis` up and the host seconds more for an
+address. how the port is handed back is the project's business, and the wait is
+what lets `ota` follow it without a guess at how long that takes.
+
   on the first boot `overlay-firstboot.service` grows persist online to fill the
   card and (tmpfs shape only) seeds the persisted identity. persist is the last
   partition and the live overlay upper, so it is both mounted and busy: parted

@@ -94,6 +94,12 @@ card half written and the device still up, to be sent the image again; one that
 loses power in that state needs its card in a reader, as does one whose new
 image does not start.
 
+`ota` first waits for the device to answer ssh at `ADDRESS`, for up to
+`OTA_WAIT_SECONDS` (60 unless set in `customize.env` or the environment), and
+sends nothing to one that does not. so it can follow at once on whatever brings
+the device's network up, such as a project telling its own service to give the
+usb port back to the shared rndis connection.
+
 NOTE: connecting to a WiFi network deactivates the shared WiFi hotspot and (if
 autoconnect is enabled) may keep it from starting on boot.
 

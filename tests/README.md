@@ -70,7 +70,11 @@ wifi hotspot, neither of which stock QEMU can emulate.
    serial to `tests/.work/console.log`. multi-boot scenarios drive the console via
    `lib/serial.py` and flush between boots with `qmp_quit`.
 4. the in-guest `image-report` service prints a report block to the console;
-   single-boot scenarios poll the log for it and assert.
+   single-boot scenarios poll the log for it and assert. it waits for the boot
+   to be over and writes the block in one go, since a report made while units
+   were still starting was split by the login prompt on a busy host. failed
+   units come as `name=result`, and one that only ran out its start timeout
+   under emulation is warned about, not counted.
 
 ## debugging
 
