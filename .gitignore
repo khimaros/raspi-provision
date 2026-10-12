@@ -4,3 +4,4 @@
 /overlay/root/.ssh/authorized_keys
 /overlay/home/*/.ssh/authorized_keys
 /target/
+__pycache__

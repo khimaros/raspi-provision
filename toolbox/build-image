@@ -18,6 +18,16 @@ MODE="${3:-}"
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PERSIST_SIZE_MIB="${PERSIST_SIZE_MIB:-128}"
+# persist starts on a multiple of this. `flash` and `ota` keep a card's persist
+# partition only when the new image has its own at the same place, and the root
+# before it is sized to its contents: unaligned, every rebuild would move it.
+PERSIST_ALIGN_MIB="${PERSIST_ALIGN_MIB:-1024}"
+# each image's own name, in its root, by which its initramfs knows a persist
+# partition that booted under another (scripts/overlay, adopt_persist), and the
+# mark at the head of the image that tells `flash` and `ota` it does so. a pi
+# does not run the boot code these bytes would otherwise be.
+IMAGE_ID_FILE=/etc/raspi-provision-image-id
+KEEP_MAGIC="raspi-provision keep 1"
 CUSTOM_HOSTNAME="${CUSTOM_HOSTNAME:?CUSTOM_HOSTNAME must be set}"
 CUSTOM_USERNAME="${CUSTOM_USERNAME:?CUSTOM_USERNAME must be set}"
 CUSTOM_PASSWORD="${CUSTOM_PASSWORD:?CUSTOM_PASSWORD must be set}"
@@ -186,7 +196,8 @@ if [ -n "$MODE" ]; then
 	p2_line="$(printf '%s\n' "$geom" | grep "start=" | sed -n 2p)"
 	p2_start=$(sed -E 's/.*start=[[:space:]]*([0-9]+).*/\1/' <<<"$p2_line")
 	p2_size=$(sed -E 's/.*size=[[:space:]]*([0-9]+).*/\1/' <<<"$p2_line")
-	p3_start=$(( ( (p2_start + p2_size + 2047) / 2048 ) * 2048 ))
+	align=$(( PERSIST_ALIGN_MIB * MIB / SECT ))
+	p3_start=$(( ( (p2_start + p2_size + align - 1) / align ) * align ))
 	p3_sectors=$(( PERSIST_SIZE_MIB * MIB / SECT ))
 	p3_end=$(( p3_start + p3_sectors - 1 ))
 	truncate -s $(( (p3_end + 1) * SECT )) "$OUT"
@@ -254,6 +265,7 @@ echo "provisioning image with guestfish (mode=${MODE:-plain})"
 			echo "chmod 0755 /usr/local/sbin/$h"
 			echo "chown 0 0 /usr/local/sbin/$h"
 		done
+		echo "write $IMAGE_ID_FILE $(cat /proc/sys/kernel/random/uuid)"
 		echo "mkdir-p /etc/systemd/system/multi-user.target.wants"
 		echo "ln-s ../overlay-firstboot.service /etc/systemd/system/multi-user.target.wants/overlay-firstboot.service"
 		# the stock root-grow fails on an overlay root (it is not a growable block
@@ -287,6 +299,7 @@ echo "provisioning image with guestfish (mode=${MODE:-plain})"
 	echo "umount-all"
 } > "$WORK/build.gf"
 guestfish -a "$OUT" < "$WORK/build.gf"
+[ -z "$MODE" ] || printf '%s' "$KEEP_MAGIC" | dd of="$OUT" conv=notrunc status=none
 
 # punch zero runs into holes so the artifact is sparse on disk.
 fallocate -d "$OUT" 2>/dev/null || true

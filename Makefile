@@ -92,9 +92,11 @@ test-ota: build
 	python3 tests/scenarios/ota-image.py
 .PHONY: test-ota
 
-# multi-boot: the writer `ota` runs on the device replaces the card it booted from.
+# multi-boot: the writer `ota` runs on the device replaces the card it booted
+# from. OTA=keep (default) leaves the persist partition, OTA=wipe replaces it.
+OTA := keep
 test-ota-write: build
-	tests/scenarios/ota-write.sh
+	tests/scenarios/ota-write.sh $(OTA)
 .PHONY: test-ota-write
 
 # standard pre-commit suite: maintain update + flash + ota + overlay provisioning (persist) + usb host mode.

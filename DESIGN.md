@@ -172,7 +172,51 @@ before any of it `ota` asks the device for `true` over ssh until it answers or
 project whose own service takes that port has to hand it back first; the device
 then needs seconds to bring `shared-rndis` up and the host seconds more for an
 address. how the port is handed back is the project's business, and the wait is
-what lets `ota` follow it without a guess at how long that takes.
+what lets `ota` follow it without a guess at how long that takes. when it gives
+up it passes on what ssh last said, since a device that is up and refused reads
+otherwise as one that is down.
+
+`flash` and `ota` both keep a card's persist partition unless told `--wipe`.
+one script, `toolbox/write-image`, does the writing for both, on the host for
+`flash` and on the device for `ota`:
+
+- the image is written from its start up to where persist begins, and no
+  further. persist is the last partition, so nothing of it is touched, however
+  far it has grown.
+- the image's partition table is written with the rest, because the root is
+  found by the disk id in it. its entry for persist is the small one of a fresh
+  image, and a filesystem larger than its partition does not mount, so the
+  card's own sixteen bytes for that entry are put back over it.
+- the command decides beforehand, from the first sector of the image and one
+  `blkid` of the card: there must be a filesystem labelled `persist` at exactly
+  the sector the image's own starts on, and the image must begin with the mark
+  `build-image` leaves on images that can adopt. anything else is a whole write.
+  `build-image` puts persist on a multiple of `PERSIST_ALIGN_MIB` so that
+  rebuilds agree on the sector.
+
+what a kept partition holds is of two kinds, and only one is safe over another
+root. `state/` is plain data, the sources of the binds. the committed layer
+and a staged commit (tmpfs shape), or the whole upper (persist shape), are
+overlay layers recorded against the OLD root: laid over a new one they bring
+back the old system's files and its package database. each image carries an id
+(`/etc/raspi-provision-image-id`), and persist records the id it last booted
+under. the initramfs compares the two before it assembles the root, and on a
+mismatch drops the layers (`adopt_persist` in `scripts/overlay`), keeping in
+the persist shape only the paths the tmpfs shape binds. it runs before the
+firmware sync, so an old committed kernel does not go back onto the new FAT.
+an image from before this has no such step, which is what the mark is for.
+NOT done: the factory snapshot on a kept partition is still the old image's.
+
+ssh host keys are on the persist partition and stay with it. they are made on
+its first boot, so a `flash` or `ota` that replaces it leaves the host holding
+keys the device no longer has, and ssh refuses a host whose key changed. after
+a whole write, and only then, both commands forget the saved keys
+(`ssh-keygen -R`) for every name the device answers to, and every ssh this tool
+runs is told to accept a host it has no key for. that is trust on first use,
+narrowed to the moment after a flash the user asked for: a key that changes with
+no flash is refused as before. the keys cannot be fetched at flash time instead,
+since a card in a reader is not a running device and an `ota` target has not yet
+restarted.
 
   on the first boot `overlay-firstboot.service` grows persist online to fill the
   card and (tmpfs shape only) seeds the persisted identity. persist is the last

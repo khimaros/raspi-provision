@@ -33,6 +33,10 @@ RAW_IMAGE="images/$CUSTOM_HOSTNAME.img"
 # baking depends adds a long qemu install to every build; only the bake-depends
 # scenario turns it on.
 export BAKE_DEPENDS="${BAKE_DEPENDS:-0}"
+# an image puts persist on the next GiB after its root. several scenarios boot
+# from a 4 GiB card, which that would leave no room on, and none of them is
+# about where persist starts.
+export PERSIST_ALIGN_MIB="${PERSIST_ALIGN_MIB:-1}"
 
 # the scenarios build images through the raspi-provision binary; prefer the debug
 # build (what `make build` produces), falling back to the release build.

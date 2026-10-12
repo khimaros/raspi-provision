@@ -48,11 +48,20 @@ config comes from `customize.env` / the Makefile defaults (hostname/user/passwor
   installs base + project depends, then full-upgrades, in that order.
 - **flash**: `raspi-provision flash` puts the image on the card byte for byte,
   from `images/<hostname>.img.gz`, a raw `.img` beside it, or a path it is given.
-- **ota**: `raspi-provision ota` copies `toolbox/ota-write` to the device, then
-  pipes it the image as gzip, compressing a raw one on the way.
-- **ota-write**: on tmpfs, the writer is given a second image, one file apart,
-  from a usb disk. it overwrites the card under the running system, and the
-  next boot is the second image.
+  a card with a persist partition where the image has its own keeps it, and its
+  own entry in the partition table; `--wipe`, a persist elsewhere and an image
+  from before images could adopt one all write the whole card.
+- **ota**: `raspi-provision ota` copies `toolbox/write-image` and
+  `toolbox/ota-write` to the device, then pipes it the image as gzip,
+  compressing a raw one on the way, and tells the writer to keep or to wipe on
+  the same grounds as `flash`. saved ssh host keys are forgotten after a wipe
+  and left after a keep, by both commands.
+- **ota-write**: on tmpfs, the writers are given a second image, one file apart,
+  from a usb disk. the card is overwritten under the running system, and the
+  next boot is the second image. kept (`OTA=keep`, the default): a file at
+  home and the ssh host key are the same after, persist is still grown, and a
+  change the old system had staged for commit does not come back. wiped
+  (`OTA=wipe`): home and the key start over.
 - **large-overlay**: an overlay bigger than the stock root lands whole, in the
   gzip image `raspi-provision image` writes when it is given no path.
 

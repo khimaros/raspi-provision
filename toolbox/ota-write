@@ -1,27 +1,30 @@
 #!/bin/bash
 # replace the image on the card this device booted from with the gzip image on
-# stdin, then restart into it. `raspi-provision ota` copies this to the device's
-# /run and pipes it the image over ssh, so a device flashed before this existed
-# takes it too. like `flash`, it replaces the whole card: persist goes with it.
+# stdin, then restart into it. `raspi-provision ota` copies this and
+# toolbox/write-image to the device's /run and pipes it the image over ssh, so a
+# device flashed before either existed takes them too. the arguments after the
+# writer's path are write-image's own: `wipe` replaces the whole card as `flash
+# --wipe` does, and `keep SECTORS` leaves the persist partition as it is.
 #
 # the card is overwritten under a running system, so that system has to go on
 # without it. everything on the card is made read-only first, so nothing the old
-# system still holds is written over the new image. every file a running program
-# has mapped is read once more, since a page the kernel fetches later would come
-# from the new image. that is a habit of the page cache and no promise: with
-# memory to spare nothing is dropped, and the pipe below needs little.
+# system still holds is written over the new image, and a persist partition that
+# is kept is left whole. every file a running program has mapped is read once
+# more, since a page the kernel fetches later would come from the new image.
+# that is a habit of the page cache and no promise: with memory to spare nothing
+# is dropped, and the pipe below needs little.
 #
 # a stream that ends early or does not decompress leaves the card half written
 # and this system still up, in memory, to be sent the image again. once it loses
 # power in that state the card needs a reader.
 #
-# run as root. usage: ota-write [card-device] < image.gz  (default: by 'bootfs' label)
+# run as root. usage: ota-write WRITE-IMAGE wipe|keep [SECTORS] < image.gz
 
 set -euo pipefail
 
 BOOT_LABEL=bootfs
-# what this script still starts after the first block is written
-TOOLS=(gzip dd sleep)
+# what this script and write-image still start after the first block is written
+TOOLS=(gzip dd head cat sleep)
 # seconds for the kernel to make the card's filesystems read-only
 REMOUNT_TIMEOUT=30
 # seconds between reporting success and the restart, for ssh to pass it on
@@ -54,21 +57,19 @@ make_read_only() {
 
 [ "$(id -u)" -eq 0 ] || die "must run as root"
 [ -t 0 ] && die "no image on stdin"
-card="${1:-}"
-if [ -z "$card" ]; then
-	boot="$(blkid -L "$BOOT_LABEL" 2>/dev/null)" || die "no '$BOOT_LABEL' partition to find the card by"
-	card="/dev/$(lsblk -no pkname "$boot")"
-fi
+[ $# -ge 2 ] || die "usage: ota-write WRITE-IMAGE wipe|keep [SECTORS] < image.gz"
+write_image=$1
+shift
+[ -r "$write_image" ] || die "no writer at $write_image"
+boot="$(blkid -L "$BOOT_LABEL" 2>/dev/null)" || die "no '$BOOT_LABEL' partition to find the card by"
+card="/dev/$(lsblk -no pkname "$boot")"
 [ -b "$card" ] || die "$card is not a block device"
 
 keep_in_memory
 make_read_only || die "filesystems still writable after ${REMOUNT_TIMEOUT}s; nothing written. restart to go on as before"
 
 echo "ota: writing $card"
-# fullblock keeps dd's blocks whole off the pipe, as direct writes need, and
-# direct keeps the image out of the page cache, where it would crowd out what
-# was read into it above. fsync, since no `sync` can be started afterwards
-if ! gzip -dc | dd of="$card" bs=4M iflag=fullblock oflag=direct conv=fsync status=progress; then
+if ! gzip -dc | bash "$write_image" "$card" "$@"; then
 	die "FAILED part way: the card holds neither image whole. this system still runs from memory, so send the image again before it loses power"
 fi
 

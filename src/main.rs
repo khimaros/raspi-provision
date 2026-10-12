@@ -26,6 +26,7 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("ADDRESS", "10.55.0.1"),
     ("OTA_WAIT_SECONDS", "60"),
     ("PERSIST_SIZE_MIB", "128"),
+    ("PERSIST_ALIGN_MIB", "1024"),
     ("BAKE_DEPENDS", "1"),
     ("IMAGE_RASPIOS", "./images/raspios-lite.img.xz"),
     ("IMAGE_RASPIOS_SOURCE", "https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2026-06-19/2026-06-18-raspios-trixie-arm64-lite.img.xz"),
@@ -39,6 +40,27 @@ const GZIP_EXTENSION: &str = "gz";
 const OTA_WRITER: &str = "/run/raspi-provision-ota-write";
 // seconds one attempt to reach the device may take, and between attempts
 const OTA_PROBE_SECONDS: u64 = 3;
+// the base image's shared connections (overlay/etc/NetworkManager): rndis,
+// ethernet, hotspot. a device answers at each whatever ADDRESS says.
+const SHARED_ADDRESSES: [&str; 3] = ["10.55.0.1", "10.55.1.1", "10.55.2.1"];
+// take the key of a host ssh has none for, and still refuse one that changed.
+// a flashed device has new keys and `flash` and `ota` forget its old ones, so
+// the first command after either would otherwise stop to ask.
+const SSH_ACCEPT_NEW: [&str; 2] = ["-o", "StrictHostKeyChecking=accept-new"];
+
+// where `ota` leaves toolbox/write-image, which the ota writer runs
+const OTA_WRITE_IMAGE: &str = "/run/raspi-provision-write-image";
+// what toolbox/build-image leaves at the head of an image whose initramfs
+// adopts a persist partition it did not make. an image without it is from
+// before that, and would lay the old system's changes over its own root.
+const KEEP_MAGIC: &[u8] = b"raspi-provision keep 1";
+const SECTOR: u64 = 512;
+// the third of an mbr's four primary partition entries, sixteen bytes each,
+// and within one the first sector and the count, both little-endian u32
+const PERSIST_ENTRY: usize = 446 + 2 * 16;
+const ENTRY_START: usize = 8;
+const ENTRY_SECTORS: usize = 12;
+const PERSIST_LABEL: &str = "persist";
 
 const INIT_CUSTOMIZE_ENV: &str = "\
 # raspi-provision project config. uncomment and edit to override the defaults;
@@ -95,19 +117,25 @@ enum Cmd {
         /// where to write it (default ./images/<hostname>.img.gz); gzip-compressed if it ends in .gz
         path: Option<PathBuf>,
     },
-    /// write a built image to the card (sudo dd, oflag=direct)
+    /// write a built image to the card (sudo dd, oflag=direct), keeping its persist partition if it has one
     Flash {
         /// the image to write, gzip-compressed if it ends in .gz (default: the one `image` builds)
         path: Option<PathBuf>,
+        /// replace the persist partition too: home, identity and saved networks start over
+        #[arg(long)]
+        wipe: bool,
     },
     /// bake an ssh public key into ./overlay (default ~/.ssh/id_rsa.pub)
     Authorize { keyfile: Option<PathBuf> },
     /// push ./overlay, install depends, and apt full-upgrade a running device
     Update,
-    /// write a built image to the card of a running device over ssh, and restart it
+    /// write a built image to the card of a running device over ssh, keeping its persist partition, and restart it
     Ota {
         /// the image to write, gzip-compressed if it ends in .gz (default: the one `image` builds)
         path: Option<PathBuf>,
+        /// replace the persist partition too: home, identity and saved networks start over
+        #[arg(long)]
+        wipe: bool,
     },
     /// open an interactive ssh session to the device
     Ssh {
@@ -152,10 +180,10 @@ fn main() {
         Cmd::Init { dir } => init(dir.unwrap_or_else(|| PathBuf::from("."))),
         Cmd::Download => download(),
         Cmd::Image { path } => image(path),
-        Cmd::Flash { path } => flash(path),
+        Cmd::Flash { path, wipe } => flash(path, wipe),
         Cmd::Authorize { keyfile } => authorize(keyfile),
         Cmd::Update => update(),
-        Cmd::Ota { path } => ota(path),
+        Cmd::Ota { path, wipe } => ota(path, wipe),
         Cmd::Ssh { root } => run(ssh_cmd(&config(), root, false, &[])),
         Cmd::Network { connection } => network(connection),
         Cmd::Nmtui => run(ssh_cmd(&config(), true, true, &["nmtui"])),
@@ -328,25 +356,103 @@ fn image_to_write(c: &Config, path: Option<PathBuf>) -> Result<PathBuf, String> 
     }
 }
 
-fn flash(path: Option<PathBuf>) -> R {
+// the first sector of an image, which holds its partition table
+fn image_head(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut head = vec![0; SECTOR as usize];
+    let whole = |r: std::io::Result<()>| r.map_err(|e| format!("{}: {e}", path.display()));
+    if !is_gzip(path) {
+        whole(fs::File::open(path).and_then(|mut file| file.read_exact(&mut head)))?;
+        return Ok(head);
+    }
+    let mut gzip = Command::new("gzip").arg("-dc").arg(path).stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
+    let read = gzip.as_mut().map_err(|e| format!("gzip: {e}"))?.stdout.take().unwrap().read_exact(&mut head);
+    // one sector was all that was wanted of it
+    let mut gzip = gzip.unwrap();
+    let _ = gzip.kill();
+    let _ = gzip.wait();
+    whole(read)?;
+    Ok(head)
+}
+
+// the sector an image's persist partition starts at, if it has one and its
+// initramfs can take over a persist partition it did not make
+fn persist_start(head: &[u8]) -> Option<u64> {
+    let field = |at: usize| u32::from_le_bytes(head[PERSIST_ENTRY + at..][..4].try_into().unwrap());
+    (head.starts_with(KEEP_MAGIC) && field(ENTRY_SECTORS) > 0).then(|| u64::from(field(ENTRY_START)))
+}
+
+// what `blkid` is asked of a card: the label of the filesystem at this sector.
+// a card that has a persist partition exactly where the image would put its
+// own answers `persist`, and that partition can be left as it is.
+fn label_probe(card: &str, sector: u64) -> String {
+    format!("blkid -p -O {} -o value -s LABEL {card}", sector * SECTOR)
+}
+
+fn is_persist(probe: std::io::Result<std::process::Output>) -> bool {
+    probe.is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == PERSIST_LABEL)
+}
+
+// what toolbox/write-image is told: keep the persist partition from this
+// sector on, or replace the whole card. kept unless asked otherwise, when the
+// image allows it and `has_persist` finds one on the card at that sector.
+fn write_mode(path: &Path, wipe: bool, has_persist: impl FnOnce(u64) -> bool) -> Result<Option<u64>, String> {
+    let start = if wipe { None } else { persist_start(&image_head(path)?) };
+    let kept = start.filter(|&sector| has_persist(sector));
+    match kept {
+        Some(_) => println!("keeping the persist partition: home, identity and saved networks stay (--wipe replaces them)"),
+        None if wipe => println!("replacing the whole card, the persist partition with it"),
+        None => println!("no persist partition to keep where this image has its own: replacing the whole card"),
+    }
+    Ok(kept)
+}
+
+fn mode_arguments(kept: Option<u64>) -> String {
+    kept.map_or("wipe".to_string(), |sector| format!("keep {sector}"))
+}
+
+fn flash(path: Option<PathBuf>, wipe: bool) -> R {
     let c = config();
     let path = image_to_write(&c, path)?;
-    let (img, dev) = (path.display(), &c["MOUNT_DEVICE"]);
-    // a compressed image is decompressed on the way to the card. dd then reads a
-    // pipe, and fullblock keeps its blocks whole, as direct writes need.
-    let read = if is_gzip(&path) {
-        format!("gzip -dc '{img}' | sudo dd iflag=fullblock")
-    } else {
-        format!("sudo dd if='{img}'")
-    };
-    // unmount any mounted partitions, then dd straight to the media: oflag=direct
-    // bypasses the page cache so a flaky usb reader cannot silently drop writes.
-    let script =
-        format!("sudo umount {dev}?* 2>/dev/null; {read} of='{dev}' bs=4M oflag=direct status=progress && sudo sync");
+    let fw = extract_framework()?;
+    let (img, dev, writer) = (path.display(), &c["MOUNT_DEVICE"], fw.join("toolbox/write-image"));
+    let kept = write_mode(&path, wipe, |sector| {
+        is_persist(Command::new("sudo").args(label_probe(dev, sector).split(' ')).output())
+    })?;
+    // a compressed image is decompressed on the way to the card
+    let read = if is_gzip(&path) { "gzip -dc" } else { "cat" };
+    // unmount any mounted partitions, then hand the image to the writer
+    let script = format!(
+        "sudo umount {dev}?* 2>/dev/null; {read} '{img}' | sudo bash '{}' '{dev}' {} && sudo sync",
+        writer.display(),
+        mode_arguments(kept)
+    );
     // pipefail, so an image that does not decompress fails the flash
     let mut cmd = Command::new("bash");
     cmd.args(["-o", "pipefail", "-c"]).arg(script);
-    run(cmd)
+    run(cmd)?;
+    // the host keys are on the persist partition, and stay with it
+    if kept.is_none() {
+        forget_host_keys(&c);
+    }
+    Ok(())
+}
+
+// drop this user's saved ssh host keys for the device, under every name it
+// answers to: a freshly written image makes new keys on its first boot, and
+// ssh refuses a host whose key changed. the next command takes the new one
+// (SSH_ACCEPT_NEW). ssh-keygen keeps the old file beside known_hosts.
+fn forget_host_keys(c: &Config) {
+    let hostname = &c["CUSTOM_HOSTNAME"];
+    let names = [c["ADDRESS"].clone(), hostname.clone(), format!("{hostname}.local")];
+    let names: BTreeSet<&str> = names.iter().map(String::as_str).chain(SHARED_ADDRESSES).collect();
+    for name in &names {
+        let mut keygen = Command::new("ssh-keygen");
+        keygen.args(["-R", name]).stdout(Stdio::null()).stderr(Stdio::null());
+        // nothing to forget, or no known_hosts at all, is as good
+        let _ = keygen.status();
+    }
+    println!("forgot the saved ssh host keys of {}", names.into_iter().collect::<Vec<_>>().join(" "));
 }
 
 fn authorize(keyfile: Option<PathBuf>) -> R {
@@ -373,7 +479,8 @@ fn update() -> R {
     // upgrade works from stale indexes, then install depends and upgrade.
     if Path::new("overlay").is_dir() {
         let mut rsync = Command::new("rsync");
-        rsync.args(["-rlptD", "--exclude=/boot/firmware", "--exclude=.gitkeep", "overlay/"])
+        rsync.args(["-e", &format!("ssh {}", SSH_ACCEPT_NEW.join(" "))])
+            .args(["-rlptD", "--exclude=/boot/firmware", "--exclude=.gitkeep", "overlay/"])
             .arg(format!("{target}:/"));
         run(rsync)?;
     }
@@ -387,43 +494,66 @@ fn update() -> R {
     run(ssh_cmd(&c, true, false, &["apt-get", "-y", "full-upgrade", "--autoremove", "--purge"]))
 }
 
-// replace the card of a running device with a built image. the device runs
-// toolbox/ota-write, handed over first so that a device flashed before `ota`
-// existed takes it too. the image always travels as gzip: the writer then
-// fails on a stream that was cut short, where a raw one would pass as whole.
 // wait until the device answers ssh, for OTA_WAIT_SECONDS at most. a device
 // asked a moment ago to bring a network up, as one that has just given its
 // usb port back to usb networking was, takes seconds to appear, and the host
-// seconds more to get an address from it.
+// seconds more to get an address from it. what ssh said of the last attempt
+// goes with the failure: a device that is up and refused, over a host key
+// that changed with its last flash, say, reads otherwise as one that is down.
 fn wait_for_device(c: &Config) -> R {
     let limit: u64 = c["OTA_WAIT_SECONDS"].parse().map_err(|_| "OTA_WAIT_SECONDS is not a number of seconds")?;
     let start = std::time::Instant::now();
     loop {
         let mut probe = Command::new("ssh");
-        probe.arg("-o").arg(format!("ConnectTimeout={OTA_PROBE_SECONDS}"));
-        probe.arg(format!("root@{}", c["ADDRESS"])).arg("true").stderr(Stdio::null());
-        if run(probe).is_ok() {
+        probe.args(SSH_ACCEPT_NEW).arg("-o").arg(format!("ConnectTimeout={OTA_PROBE_SECONDS}"));
+        probe.arg(format!("root@{}", c["ADDRESS"])).arg("true");
+        let answer = probe.output().map_err(|e| format!("ssh: {e}"))?;
+        if answer.status.success() {
             return Ok(());
         }
         if start.elapsed().as_secs() >= limit {
-            return Err(format!("no answer from {} over ssh in {limit}s", c["ADDRESS"]));
+            let said = String::from_utf8_lossy(&answer.stderr);
+            return Err(format!("no answer from {} over ssh in {limit}s. ssh said:\n{}", c["ADDRESS"], said.trim_end()));
         }
         std::thread::sleep(std::time::Duration::from_secs(OTA_PROBE_SECONDS));
     }
 }
 
-fn ota(path: Option<PathBuf>) -> R {
+// replace the card of a running device with a built image. the device runs
+// toolbox/ota-write, handed over first so that a device flashed before `ota`
+// existed takes it too. the image always travels as gzip: the writer then
+// fails on a stream that was cut short, where a raw one would pass as whole.
+fn ota(path: Option<PathBuf>, wipe: bool) -> R {
     let c = config();
     let path = image_to_write(&c, path)?;
     wait_for_device(&c)?;
+    // the card is the disk the device's boot partition is on, as ota-write finds it
+    let card = "/dev/$(lsblk -no pkname \"$(blkid -L bootfs)\")";
+    let kept = write_mode(&path, wipe, |sector| {
+        is_persist(ssh_cmd(&c, true, false, &[&label_probe(card, sector)]).stderr(Stdio::null()).output())
+    })?;
+    send_image(&c, &path, kept)?;
+    if kept.is_none() {
+        forget_host_keys(&c);
+    }
+    Ok(())
+}
+
+// hand the device a script from toolbox/, to run from its ram
+fn push_script(c: &Config, fw: &Path, name: &str, place: &str) -> R {
+    let script = fs::File::open(fw.join("toolbox").join(name)).map_err(|e| format!("{name}: {e}"))?;
+    let mut push = ssh_cmd(c, true, false, &["cat", ">", place]);
+    push.stdin(script);
+    run(push)
+}
+
+fn send_image(c: &Config, path: &Path, kept: Option<u64>) -> R {
     let fw = extract_framework()?;
-    let writer = fs::File::open(fw.join("toolbox/ota-write")).map_err(|e| format!("ota-write: {e}"))?;
-    let mut push = ssh_cmd(&c, true, false, &["cat", ">", OTA_WRITER]);
-    push.stdin(writer);
-    run(push)?;
-    let mut write = ssh_cmd(&c, true, false, &["bash", OTA_WRITER]);
-    let image = fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if is_gzip(&path) {
+    push_script(c, &fw, "write-image", OTA_WRITE_IMAGE)?;
+    push_script(c, &fw, "ota-write", OTA_WRITER)?;
+    let mut write = ssh_cmd(c, true, false, &["bash", OTA_WRITER, OTA_WRITE_IMAGE, &mode_arguments(kept)]);
+    let image = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if is_gzip(path) {
         write.stdin(image);
         return run(write);
     }
@@ -453,6 +583,7 @@ fn device(remote: &[&str]) -> R {
 fn ssh_cmd(c: &Config, root: bool, tty: bool, remote: &[&str]) -> Command {
     let user = if root { "root" } else { c["CUSTOM_USERNAME"].as_str() };
     let mut cmd = Command::new("ssh");
+    cmd.args(SSH_ACCEPT_NEW);
     if tty {
         cmd.arg("-t");
     }

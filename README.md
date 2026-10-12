@@ -63,6 +63,22 @@ images side by side: `raspi-provision image images/kiosk.img.gz`, then
 `raspi-provision flash images/kiosk.img.gz`. a path that does not end in `.gz` is
 a raw image.
 
+a card that was flashed before KEEPS ITS PERSIST PARTITION, with `flash` and
+with `ota` (below): `/home`, the ssh host keys and machine id, saved network
+connections and whatever a project lists in `/etc/persist.d` are as they were
+under the new image. what does not carry over is any change made to the old
+system itself, committed or not, since it was recorded against the old root:
+the new image drops those on its first boot. `--wipe` on either command
+replaces the partition too, for a card that starts over.
+
+keeping needs the card's persist partition to be exactly where the new image
+has its own, and says so when it is not and the whole card is written instead.
+the root before it is sized to its contents, so persist starts on the next
+multiple of `PERSIST_ALIGN_MIB` (1024) after it: rebuilds of one project land
+on the same place, and an image that grew past a boundary, or a different
+project's, does not. an image built before this existed is never kept under,
+as it would not know to drop the old system's changes.
+
 set `OVERLAY=persist` (or `tmpfs`) in `customize.env` for the read-only overlay
 root (see [resilience](#resilience)).
 
@@ -87,9 +103,9 @@ raspi-provision ota              # DESTRUCTIVE: write a built image to its card,
 
 `ota` is `flash` for a device that is up: it sends the image over ssh, the
 device writes it to the card it booted from and restarts into it, and the card
-never leaves the device. it takes the same optional path as `flash`, and like a
-flash it replaces everything on the card, `persist` included. the device goes on
-running from memory while its card is written. a transfer that fails leaves the
+never leaves the device. it takes the same optional path as `flash`, and keeps
+the persist partition or, with `--wipe`, replaces it, as `flash` does. the
+device goes on running from memory while its card is written. a transfer that fails leaves the
 card half written and the device still up, to be sent the image again; one that
 loses power in that state needs its card in a reader, as does one whose new
 image does not start.
@@ -99,6 +115,13 @@ image does not start.
 sends nothing to one that does not. so it can follow at once on whatever brings
 the device's network up, such as a project telling its own service to give the
 usb port back to the shared rndis connection.
+
+a device whose persist partition was replaced makes new ssh host keys on its
+first boot. after such a `flash` or `ota`, and only then, the keys saved for it
+in your `known_hosts` are forgotten, under its `ADDRESS`, its hostname (and `.local`) and the three shared addresses,
+and every command here that uses ssh takes the key of a host it has none for
+(`StrictHostKeyChecking=accept-new`). a key that changes at any other time is
+still refused. `ssh-keygen` leaves the file as it was in `known_hosts.old`.
 
 NOTE: connecting to a WiFi network deactivates the shared WiFi hotspot and (if
 autoconnect is enabled) may keep it from starting on boot.

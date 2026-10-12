@@ -1,0 +1,64 @@
+#!/bin/bash
+# write the raw image on stdin to a card: all of it, or all of it that comes
+# before the persist partition, which then keeps what it holds. `flash` runs this
+# on the host and `ota`, through toolbox/ota-write, on the device itself.
+#
+#   write-image CARD wipe
+#   write-image CARD keep SECTORS    # SECTORS: where persist starts on both
+#
+# keeping is for a card that already has a persist partition where the image puts
+# its own. the caller checks that (a filesystem labelled persist at that sector)
+# and that the image knows what to do with a persist it did not make, which the
+# initramfs of an image built since does (scripts/overlay, adopt_persist).
+#
+# the image's partition table is written with the rest, since the root is found
+# by the disk id in it. but its entry for persist is the small one of a fresh
+# image, and a filesystem larger than its partition does not mount, so the card's
+# own entry is put back over it.
+#
+# on a device this runs while the card it writes is the one it booted from, so
+# after the first block nothing may be started that is not already in memory:
+# dd, head and cat, which ota-write reads in beforehand, and the shell's builtins.
+set -euo pipefail
+
+SECTOR=512
+# the third of an mbr's four primary partition entries, sixteen bytes each
+ENTRY_OFFSET=$((446 + 2 * 16))
+ENTRY_BYTES=16
+BLOCK=4M
+
+usage() { echo "usage: write-image CARD wipe | write-image CARD keep SECTORS" >&2; exit 2; }
+
+[ $# -ge 2 ] || usage
+card=$1 mode=$2
+
+# fullblock keeps dd's blocks whole off a pipe, as direct writes need. direct
+# bypasses the page cache: a flaky usb reader cannot drop cached writes in
+# silence, and on a device the image does not crowd out what is held in memory.
+# fsync, since on a device no `sync` can be started afterwards
+write() { dd of="$card" bs="$BLOCK" iflag=fullblock oflag=direct conv="$1" status=progress; }
+
+case $mode in
+	wipe)
+		[ $# -eq 2 ] || usage
+		write fsync
+		;;
+	keep)
+		[ $# -eq 3 ] || usage
+		sectors=$3
+		# as \xNN escapes in a variable and back through printf, a builtin: no
+		# file, and nothing to start once the card is being written
+		entry=$(dd if="$card" bs=1 skip="$ENTRY_OFFSET" count="$ENTRY_BYTES" status=none | od -An -v -tx1 | tr -d ' \n' | sed 's/../\\x&/g')
+		[ "${#entry}" -eq $((ENTRY_BYTES * 4)) ] || { echo "write-image: cannot read the partition table of $card" >&2; exit 1; }
+		# notrunc: a card that is a file, as in the tests, keeps what follows
+		head -c "$((sectors * SECTOR))" | write notrunc,fsync
+		# the rest of the image is the fresh persist, not wanted. read to its end
+		# all the same: the sender must not be cut off, and a compressed stream
+		# is only known to be whole once its last byte has been checked
+		cat > /dev/null
+		# shellcheck disable=SC2059
+		printf "$entry" | dd of="$card" bs=1 seek="$ENTRY_OFFSET" count="$ENTRY_BYTES" conv=notrunc,fsync status=none
+		echo "write-image: kept the persist partition of $card"
+		;;
+	*) usage ;;
+esac

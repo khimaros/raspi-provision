@@ -14,7 +14,8 @@ framework itself.
   root. a downstream project layers its own `overlay/` on top (last-writer-wins)
 - `depends/` -- base package lists installed by `update` (one per line, # comments)
 - `toolbox/` -- the offline build engine (`build-image`, `bake-depends`) and on-device helpers
-  (`grow-persist`, `seed-persist`, `overlay-commit`, `ota-write`)
+  (`grow-persist`, `seed-persist`, `overlay-commit`, `ota-write`), and
+  `write-image`, which puts an image on a card for `flash` and for `ota`
 - `tests/` -- the root-free qemu harness (see [tests/README.md](tests/README.md))
 
 ## build
@@ -56,12 +57,15 @@ scenarios read `CUSTOM_*` from the environment.
   directory in `/etc/persist.d`, cut the power, assert it alone kept its file
 - `make test-update`        -- device-free: fake `ssh`/`rsync` record the `update`
   command sequence and assert apt lists refresh before the depends install
-- `make test-flash`         -- device-free: a fake `sudo` runs `dd` against a file
-  standing in for the card, and assert it holds the image, gzip or raw, named or not
+- `make test-flash`         -- device-free: a fake `sudo` runs the writer against a file
+  standing in for the card, and assert it holds the image, gzip or raw, named or
+  not, with its persist partition kept when it has one in the right place
 - `make test-ota`           -- device-free: a fake `ssh` keeps what `ota` sends, and
-  assert the device is handed the writer, then the image as gzip
-- `make test-ota-write`     -- tmpfs: hand `toolbox/ota-write` a second image on a
-  booted system, power-cycle, assert the card boots that image
+  assert the device is handed the writers, then the image as gzip, to keep or wipe
+- `make test-ota-write`     -- tmpfs: hand the writers a second image on a booted
+  system, power-cycle, assert the card boots that image with home and the host
+  key kept and the old system's changes gone. `OTA=wipe` for the other way.
+  about 45 minutes, so not in `make test`
 - `make test`               -- the standard pre-commit suite: `test-update` +
   `test-flash` + `test-ota` + `test-e2e` (persist) + `test-usb-host`
 - `make test-clean`         -- remove work artifacts in `tests/.work/`
