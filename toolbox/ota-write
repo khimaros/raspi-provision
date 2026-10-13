@@ -32,10 +32,12 @@ RESTART_DELAY=2
 
 die() { echo "ota: $*" >&2; exit 1; }
 
-# hold every file a running program has mapped, and the tools, in the page cache
+# hold every file a running program has mapped, and the tools, in the page
+# cache. files only: a program that draws has the gpu's device mapped, and
+# reading a device may never come to an end
 keep_in_memory() {
-	{ awk '$6 ~ "^/" { print $6 }' /proc/[0-9]*/maps 2>/dev/null; command -v "${TOOLS[@]}"; } \
-		| sort -u | xargs -r -d '\n' cat 2>/dev/null >/dev/null || true
+	{ awk '$6 ~ "^/" { print $6 }' /proc/[0-9]*/maps 2>/dev/null; command -v "${TOOLS[@]}"; } | sort -u \
+		| while IFS= read -r mapped; do [ ! -f "$mapped" ] || cat "$mapped" 2>/dev/null || true; done >/dev/null
 }
 
 # true while a filesystem on a block device still takes writes

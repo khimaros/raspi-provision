@@ -35,6 +35,9 @@ FIRST="$WORK/ota-first-boot.log"
 # more than persist is in any fresh image (128 MiB unless a project asks)
 GROWN_MB=512
 WRITTEN="ota: written"
+# a program with a device mapped, as one that draws has the gpu's: the writer
+# reads what programs have mapped into memory, and a device has no end to read to
+MAPS_A_DEVICE="import mmap, time; device = open('/dev/zero', 'rb'); held = mmap.mmap(device.fileno(), 4096, mmap.MAP_PRIVATE, mmap.PROT_READ); time.sleep(86400)"
 # for the guest to print the marker and reach its restart before qemu is stopped
 SETTLE=10
 # seconds, on top of the boot, for the write: qemu's card took 3 GB at 2.4 MB/s
@@ -75,6 +78,7 @@ for i in \$(seq 1 30); do [ "\$(systemctl is-active overlay-firstboot 2>/dev/nul
 echo "B1_MARKER=\$(cat $MARKER 2>/dev/null || echo none)"
 echo "B1_KEY=\$(cut -d' ' -f2 $HOST_KEY)"
 echo kept > ~/$KEPT
+nohup python3 -c "$MAPS_A_DEVICE" > /dev/null 2>&1 &
 echo stale | sudo tee $STALE > /dev/null
 sudo overlay-commit --no-reboot > /dev/null
 echo "B1_STAGED=\$(sudo test -e /persist/staging/data$STALE && echo yes || echo no)"
